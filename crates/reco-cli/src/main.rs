@@ -123,6 +123,14 @@ struct Cli {
 enum Commands {
     /// Stitch two video files into a panoramic output.
     Stitch {
+        /// Fixed cylindrical panorama or the legacy perspective viewport.
+        #[arg(long, default_value = "perspective", value_parser = ["panorama", "perspective"])]
+        projection: String,
+
+        /// Completed separate-camera manifest for capture-time alignment.
+        #[arg(long)]
+        source_manifest: Option<String>,
+
         /// Path to the left camera video file.
         left: String,
 
@@ -316,6 +324,9 @@ enum Commands {
     /// Stitch live camera feeds in real time.
     #[cfg(feature = "gstreamer")]
     Camera {
+        /// Fixed cylindrical panorama or a movable perspective crop.
+        #[arg(long, default_value = "perspective", value_parser = ["panorama", "perspective"])]
+        projection: String,
         /// Left camera device (sensor ID on Jetson, e.g. "0"; device path on Linux, e.g. "/dev/video0").
         #[arg(long)]
         left_device: String,
@@ -329,8 +340,28 @@ enum Commands {
         calibration: String,
 
         /// Output file path.
-        #[arg(short, long)]
-        output: String,
+        #[arg(short, long, required_unless_present = "no_panorama_file")]
+        output: Option<String>,
+
+        /// Stream the stitched viewfinder without saving a panorama file.
+        #[arg(long, requires = "stream_url")]
+        no_panorama_file: bool,
+
+        /// New directory for separate left/right camera files and timing manifest.
+        #[arg(long, conflicts_with_all = ["v4l2_direct", "live_calibrate"])]
+        source_dir: Option<std::path::PathBuf>,
+
+        /// Separate-camera recording dimensions, independent of viewfinder size.
+        #[arg(long, requires = "source_dir", default_value = "2016x1520", value_parser = parse_wxh)]
+        source_size: (u32, u32),
+
+        /// H.264 CRF for the separate camera files (lower is higher quality).
+        #[arg(long, requires = "source_dir", default_value_t = 18, value_parser = clap::value_parser!(u32).range(0..=51))]
+        source_crf: u32,
+
+        /// Maximum stitched viewfinder rate; independent source files retain the capture rate.
+        #[arg(long)]
+        preview_fps: Option<u32>,
 
         /// Capture width in pixels.
         #[arg(long, default_value_t = 3840)]
@@ -456,13 +487,42 @@ enum Commands {
         live_calibrate: bool,
 
         /// Number of frame pairs to sample for live calibration.
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 3)]
         calibrate_frames: usize,
 
         /// Left camera lens profile JSON (for calibration).
         /// Falls back to ~/imx477_profile.json if not specified.
         #[arg(long)]
         left_lens_profile: Option<String>,
+
+        /// Explicit NVIDIA sensor mode (for example 0, 1, or 2).
+        #[arg(long)]
+        sensor_mode: Option<u32>,
+
+        /// Use the NVIDIA ISP automatic exposure loop.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        auto_exposure: bool,
+
+        /// Exposure range in nanoseconds as MIN,MAX. Manual exposure uses equal values.
+        #[arg(long, value_parser = parse_u64_pair)]
+        exposure_range: Option<(u64, u64)>,
+
+        /// Analog gain range as MIN,MAX.
+        #[arg(long, value_parser = parse_f32_pair)]
+        gain_range: Option<(f32, f32)>,
+
+        /// ISP digital gain range as MIN,MAX.
+        #[arg(long, value_parser = parse_f32_pair)]
+        digital_gain_range: Option<(f32, f32)>,
+
+        /// NVIDIA white-balance mode: off, auto, incandescent, fluorescent,
+        /// tungsten, daylight, cloudy, twilight, shade, or warm-fluorescent.
+        #[arg(long, default_value = "auto")]
+        awb_mode: String,
+
+        /// Lock the automatic white-balance result at pipeline start.
+        #[arg(long, default_value_t = false)]
+        lock_awb: bool,
     },
 
     /// Stitch live RPi CSI camera feeds via libcamera (rpicam-vid).
@@ -715,6 +775,36 @@ fn parse_wxh(s: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+fn parse_u64_pair(s: &str) -> Result<(u64, u64), String> {
+    let (min, max) = s
+        .split_once(',')
+        .ok_or_else(|| format!("expected MIN,MAX, got {s:?}"))?;
+    let min = min
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid minimum {min:?}: {e}"))?;
+    let max = max
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid maximum {max:?}: {e}"))?;
+    Ok((min, max))
+}
+
+fn parse_f32_pair(s: &str) -> Result<(f32, f32), String> {
+    let (min, max) = s
+        .split_once(',')
+        .ok_or_else(|| format!("expected MIN,MAX, got {s:?}"))?;
+    let min = min
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid minimum {min:?}: {e}"))?;
+    let max = max
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid maximum {max:?}: {e}"))?;
+    Ok((min, max))
+}
+
 fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     quiet_libva_info_by_default();
@@ -747,6 +837,8 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Stitch {
+            projection,
+            source_manifest,
             left,
             right,
             calibration,
@@ -778,6 +870,8 @@ fn main() -> anyhow::Result<()> {
             panner_preset,
         } => stitch::run_stitch(
             stitch::StitchArgs {
+                projection: &projection,
+                source_manifest: source_manifest.as_deref(),
                 left: &left,
                 right: &right,
                 calibration: &calibration,
@@ -845,10 +939,16 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "gstreamer")]
         Commands::Camera {
+            projection,
             left_device,
             right_device,
             calibration,
             output,
+            no_panorama_file,
+            source_dir,
+            source_size,
+            source_crf,
+            preview_fps,
             capture_width,
             capture_height,
             capture_fps,
@@ -876,8 +976,15 @@ fn main() -> anyhow::Result<()> {
             live_calibrate,
             calibrate_frames,
             left_lens_profile,
+            sensor_mode,
+            auto_exposure,
+            exposure_range,
+            gain_range,
+            digital_gain_range,
+            awb_mode,
+            lock_awb,
         } => {
-            use reco_io::gstreamer::camera::CameraConfig;
+            use reco_io::gstreamer::camera::{CameraConfig, CameraControls, ExposureMode};
 
             const MAX_DIM: u32 = 8192;
             anyhow::ensure!(
@@ -887,7 +994,28 @@ fn main() -> anyhow::Result<()> {
                 height,
             );
 
+            let output = output.as_deref().unwrap_or("viewfinder");
             log::info!("Camera capture: {left_device} + {right_device} -> {output}");
+
+            let awb_mode = CameraControls::awb_mode_from_str(&awb_mode)
+                .ok_or_else(|| anyhow::anyhow!("invalid AWB mode {awb_mode:?}"))?;
+            let controls = CameraControls {
+                sensor_mode,
+                exposure_mode: if auto_exposure {
+                    ExposureMode::Auto
+                } else {
+                    ExposureMode::Manual
+                },
+                exposure_min_ns: exposure_range.map(|range| range.0),
+                exposure_max_ns: exposure_range.map(|range| range.1),
+                gain_min: gain_range.map(|range| range.0),
+                gain_max: gain_range.map(|range| range.1),
+                digital_gain_min: digital_gain_range.map(|range| range.0),
+                digital_gain_max: digital_gain_range.map(|range| range.1),
+                awb_mode,
+                awb_lock: lock_awb,
+            };
+            controls.validate().map_err(anyhow::Error::msg)?;
 
             let cam_config = CameraConfig {
                 width: capture_width,
@@ -900,21 +1028,40 @@ fn main() -> anyhow::Result<()> {
             if live_calibrate {
                 return camera::run_live_calibrate(
                     cam_config,
+                    controls,
                     &calibration,
                     capture_width,
                     capture_height,
                     calibrate_frames,
-                    left_lens_profile.as_deref(),
-                    None,
+                    camera::CalibrationProfiles {
+                        left: left_lens_profile.as_deref(),
+                        right: None,
+                    },
                     &interrupted,
                 );
             }
 
             camera::run_camera(
                 camera::CameraRunConfig {
+                    projection: if projection == "panorama" {
+                        reco_core::render::viewport::OutputProjection::Panorama
+                    } else {
+                        reco_core::render::viewport::OutputProjection::Perspective
+                    },
                     cam_config,
+                    controls,
                     calibration: &calibration,
-                    output: &output,
+                    output,
+                    no_panorama_file,
+                    preview_fps,
+                    source_recording: source_dir.map(|directory| {
+                        reco_io::gstreamer::source_recording::SourceRecordingConfig {
+                            directory,
+                            width: source_size.0,
+                            height: source_size.1,
+                            crf: source_crf,
+                        }
+                    }),
                     width,
                     height,
                     blend,
@@ -1150,5 +1297,62 @@ fn main() -> anyhow::Result<()> {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, feature = "gstreamer"))]
+mod source_cli_tests {
+    use super::*;
+
+    fn camera_args(extra: &[&str]) -> Vec<String> {
+        [
+            "reco",
+            "camera",
+            "--left-device",
+            "0",
+            "--right-device",
+            "1",
+            "--calibration",
+            "cal.json",
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn ordinary_recording_remains_valid_and_preview_requires_a_stream() {
+        assert!(Cli::try_parse_from(camera_args(&["--output", "out.mkv"])).is_ok());
+        assert!(Cli::try_parse_from(camera_args(&["--no-panorama-file"])).is_err());
+        assert!(
+            Cli::try_parse_from(camera_args(&[
+                "--no-panorama-file",
+                "--stream-url",
+                "rtmp://localhost/live"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(camera_args(&[
+                "--output",
+                "out.mkv",
+                "--source-dir",
+                "new-session",
+                "--source-size",
+                "2016x1520"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(camera_args(&[
+                "--output",
+                "out.mkv",
+                "--source-dir",
+                "new-session",
+                "--v4l2-direct"
+            ]))
+            .is_err()
+        );
     }
 }

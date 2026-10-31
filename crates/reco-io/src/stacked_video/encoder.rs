@@ -144,6 +144,7 @@ impl StackedEncoder {
                 Container::Mp4Fragmented => "fmp4",
                 Container::Matroska => "mkv",
                 Container::Flv => "flv",
+                Container::Null => "null",
             },
         );
         Ok(Self { layout, encoder })

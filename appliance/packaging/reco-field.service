@@ -1,0 +1,51 @@
+[Unit]
+Description=Reco Field local operator service
+After=network-online.target nvargus-daemon.service reco-field-relay.service reco-field-network.service
+Wants=network-online.target nvargus-daemon.service reco-field-network.service
+Requires=reco-field-relay.service
+RequiresMountsFor=/var/lib/reco-field
+
+[Service]
+Type=simple
+User=recofield
+Group=recofield
+SupplementaryGroups=video render
+UMask=0077
+WorkingDirectory=/var/lib/reco-field
+Environment=HOME=/var/lib/reco-field
+Environment=RECO_FIELD_DATA_DIR=/var/lib/reco-field
+Environment=RECO_FIELD_MEDIAMTX_BIN=/opt/reco-field/current/bin/mediamtx
+Environment=RECO_FIELD_MEDIAMTX_CONFIG=/etc/reco-field/mediamtx.yml
+Environment=RECO_FIELD_RECO_BIN=/opt/reco-field/current/bin/reco
+Environment=RECO_FIELD_FFMPEG_BIN=/usr/bin/ffmpeg
+Environment=RECO_FIELD_GST_INSPECT_BIN=/usr/bin/gst-inspect-1.0
+Environment=RECO_FIELD_GST_LAUNCH_BIN=/usr/bin/gst-launch-1.0
+Environment=RECO_FIELD_MANAGE_RELAY=0
+Environment=RECO_FIELD_RTMP_PORT=1936
+Environment=RECO_FIELD_HLS_PORT=8887
+Environment=RECO_FIELD_NETWORK_SOCKET=/run/reco-field-network/control.sock
+EnvironmentFile=/etc/reco-field/reco-field.env
+ExecStart=/opt/reco-field/current/venv/bin/python -m reco_field serve --bind 0.0.0.0 --port 8081
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=25
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateTmp=no
+PrivateDevices=no
+StateDirectory=reco-field
+StateDirectoryMode=0700
+LogsDirectory=reco-field
+LogsDirectoryMode=0700
+ReadWritePaths=/var/lib/reco-field /var/log/reco-field
+
+[Install]
+WantedBy=multi-user.target

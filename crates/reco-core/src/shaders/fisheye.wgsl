@@ -14,7 +14,7 @@ struct Uniforms {
     intrinsics: vec4<f32>,
     // KB4 distortion coefficients (k1, k2, k3, k4)
     dist: vec4<f32>,
-    // YUV color transfer: scale.xyz (Y, U, V), pad
+    // YUV color transfer: scale.xyz (Y, U, V); w: input matrix (0=709, 1=601)
     color_scale: vec4<f32>,
     // YUV color transfer: offset.xyz (Y, U, V), blend_width
     color_offset_blend: vec4<f32>,
@@ -28,6 +28,9 @@ struct Uniforms {
     // lens_preview.x: correction_amount (0.0 = no correction, 1.0 = full KB4)
     // lens_preview.y: split_view (> 0.5 = left half uncorrected, right half corrected)
     lens_preview: vec4<f32>,
+    panorama_to_plane: mat4x4<f32>,
+    panorama_bounds: vec4<f32>,
+    panorama_plane: vec4<f32>,
 };
 
 // YUV420P plane textures (Y = full res R8Unorm, U/V = half res R8Unorm)
@@ -98,7 +101,7 @@ fn apply_color_transfer(rgb: vec3<f32>, scale: vec3<f32>, offset: vec3<f32>) -> 
 ///       (source already sRGB-domain, skip YUV conversion).
 ///
 /// H.264 uses limited range (Y: 16-235, Cb/Cr: 16-240). After the
-/// BT.709 matrix we get sRGB-domain values which we write as-is to
+/// selected input matrix we get R'G'B' values which we write as-is to
 /// the `Rgba8Unorm` render target.
 fn sample_yuv(uv: vec2<f32>) -> vec4<f32> {
     // Apply 180-degree rotation for the GPU zero-copy path.
@@ -133,7 +136,7 @@ fn sample_yuv(uv: vec2<f32>) -> vec4<f32> {
         v_raw = textureSample(t_v, s_video, sample_uv).r;
     }
 
-    // BT.709 YCbCr -> R'G'B'. Range scaling depends on flags.w:
+    // YCbCr -> R'G'B'. Range scaling depends on flags.w:
     //   0 = limited range (Y: 16-235, Cb/Cr: 16-240)
     //   1 = full range (Y: 0-255, Cb/Cr: 0-255)
     var y: f32;
@@ -149,20 +152,19 @@ fn sample_yuv(uv: vec2<f32>) -> vec4<f32> {
         cr = (v_raw - 128.0 / 255.0) * (255.0 / 224.0);
     }
 
-    let r = y + 1.5748 * cr;
-    let g = y - 0.1873 * cb - 0.4681 * cr;
-    let b = y + 1.8556 * cb;
-
-    let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
-    // BT.709 YCbCr->R'G'B' produces sRGB-domain values directly.
+    var decoded = vec3<f32>(y + 1.5748 * cr, y - 0.1873 * cb - 0.4681 * cr, y + 1.8556 * cb);
+    if u.color_scale.w > 0.5 {
+        decoded = vec3<f32>(y + 1.402 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.772 * cb);
+    }
+    let rgb = clamp(decoded, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Matrix conversion recovers nonlinear R'G'B' values directly.
     // Render target is Rgba8Unorm, so we write sRGB values as-is.
     return vec4<f32>(rgb, 1.0);
 }
 
 // ---- Fragment shader ----
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn shade(in: VertexOutput, warp: bool) -> vec4<f32> {
     // Remap UV from [0,1] to [-0.5, 1.5] in the fragment shader.
     // This extends the coordinate space so the undistortion can
     // map points outside the plane back to valid texture coords.
@@ -235,6 +237,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let edge_dist = uv.x;
         alpha = smoothstep(0.0, blend_width, edge_dist);
     }
+    // Keep valid pixels distinguishable from missing coverage in the stitch pass.
+    if warp { alpha = 0.001 + alpha * 0.999; }
 
     // Split-view separator line (1px white at the midpoint)
     if u.lens_preview.y > 0.5 && abs(uv.x - 0.5) < 0.001 {
@@ -242,4 +246,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return vec4<f32>(color, alpha);
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return shade(in, false);
+}
+
+@fragment
+fn fs_warp(in: VertexOutput) -> @location(0) vec4<f32> {
+    return shade(in, true);
+}
+
+@vertex
+fn vs_panorama(@builtin(vertex_index) index: u32) -> VertexOutput {
+    let positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    let p = positions[index];
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_panorama(in: VertexOutput) -> @location(0) vec4<f32> {
+    let yaw = u.panorama_bounds.x + in.uv.x * u.panorama_bounds.y;
+    let height = u.panorama_bounds.z - in.uv.y * u.panorama_bounds.w;
+    let direction = (u.panorama_to_plane * vec4<f32>(sin(yaw), height, -cos(yaw), 0.0)).xyz;
+    let origin = u.panorama_to_plane[3].xyz;
+    if abs(direction.z) < 0.000001 { return vec4<f32>(0.0); }
+    let distance = -origin.z / direction.z;
+    if distance <= 0.0 { return vec4<f32>(0.0); }
+    let hit = origin + direction * distance;
+    let uv = vec2<f32>(hit.x / u.panorama_plane.x + 0.5, 0.5 - hit.y * u.panorama_plane.y / u.panorama_plane.x);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) { return vec4<f32>(0.0); }
+    var plane = in;
+    plane.uv = uv;
+    return shade(plane, true);
 }

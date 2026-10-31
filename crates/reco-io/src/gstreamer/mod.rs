@@ -14,3 +14,4 @@
 pub mod camera;
 #[cfg(target_os = "linux")]
 pub mod nvmm;
+pub mod source_recording;

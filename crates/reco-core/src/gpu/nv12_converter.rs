@@ -13,10 +13,10 @@
 //!
 //! ## Triple-buffered readback
 //!
-//! Uses three staging buffers to eliminate blocking GPU polls. The CPU
-//! always reads back from 2 frames ago, which is guaranteed to have
-//! completed on the GPU. A non-blocking `PollType::Poll` is used instead
-//! of `wait_indefinitely()`, with a blocking fallback as a safety net.
+//! Uses three staging buffers to overlap GPU copies and CPU readback. The CPU
+//! reads back from 2 frames ago. Mapping is scheduled with each copy,
+//! allowing it to complete before the CPU consumes that slot. A delayed
+//! slot waits only for its own submission, with a bounded timeout.
 //!
 //! ## Performance
 //!
@@ -30,7 +30,15 @@
 
 use super::GpuContext;
 use bytemuck::{Pod, Zeroable};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
+
+struct ReadbackSlot {
+    tx: mpsc::SyncSender<Result<(), wgpu::BufferAsyncError>>,
+    rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    submission: Option<wgpu::SubmissionIndex>,
+}
 
 /// Uniform parameters for the RGBA→NV12 compute shader.
 #[repr(C)]
@@ -46,9 +54,9 @@ struct Nv12Params {
 /// Call [`convert_and_readback`](Self::convert_and_readback) after rendering
 /// each frame to get NV12 data ready for the encoder.
 ///
-/// Uses three staging buffers so the CPU always reads from 2 frames ago,
-/// which is guaranteed complete on the GPU. This eliminates the blocking
-/// `device.poll(Wait)` stall (7-14ms) by using non-blocking `PollType::Poll`.
+/// Uses three staging buffers so copying and mapping can overlap with
+/// subsequent frames. A late readback waits for that slot's submission,
+/// rather than all queued rendering work.
 ///
 /// The write slot cycles 0 -> 1 -> 2 -> 0. The read slot is always
 /// `(write_slot + 1) % 3`, which was written 2 frames ago.
@@ -79,9 +87,11 @@ pub struct Nv12Converter {
     cached_bind_group: Option<(*const wgpu::Texture, wgpu::BindGroup)>,
     /// Triple-buffered readback buffers (avoids 3 MB allocation per frame at 1080p).
     readback_buffers: [Vec<u8>; 3],
-    /// Reusable channel for map_async signaling (avoids per-frame channel alloc).
-    map_tx: std::sync::mpsc::SyncSender<Result<(), wgpu::BufferAsyncError>>,
-    map_rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    readback_slots: [ReadbackSlot; 3],
+    readback_count: u64,
+    wait_count: u64,
+    wait_time: Duration,
+    copy_time: Duration,
     width: u32,
     height: u32,
     /// Dispatch dimensions for the compute shader.
@@ -179,8 +189,7 @@ impl Nv12Converter {
         });
 
         // Triple-buffered CPU-readable staging buffers for pipelined readback.
-        // The third buffer ensures we always read from 2 frames ago (guaranteed
-        // complete), eliminating the blocking poll.
+        // The third buffer lets copying and mapping overlap later frames.
         let nv12_staging_buffers = [
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("nv12_staging_0"),
@@ -225,8 +234,6 @@ impl Nv12Converter {
             dispatch_y,
         );
 
-        let (map_tx, map_rx) = std::sync::mpsc::sync_channel(1);
-
         Ok(Self {
             pipeline,
             bind_group_layout,
@@ -241,8 +248,18 @@ impl Nv12Converter {
                 vec![0u8; nv12_bytes as usize],
                 vec![0u8; nv12_bytes as usize],
             ],
-            map_tx,
-            map_rx,
+            readback_slots: std::array::from_fn(|_| {
+                let (tx, rx) = mpsc::sync_channel(1);
+                ReadbackSlot {
+                    tx,
+                    rx,
+                    submission: None,
+                }
+            }),
+            readback_count: 0,
+            wait_count: 0,
+            wait_time: Duration::ZERO,
+            copy_time: Duration::ZERO,
             width,
             height,
             dispatch_x,
@@ -253,9 +270,8 @@ impl Nv12Converter {
     /// Convert the RGBA render target to NV12 and read back to CPU.
     ///
     /// Uses triple-buffered staging: this frame's GPU work writes to the
-    /// current slot, while the CPU reads back from 2 frames ago (guaranteed
-    /// complete). A non-blocking `PollType::Poll` replaces the previous
-    /// blocking `wait_indefinitely()`.
+    /// current slot, while the CPU reads back from 2 frames ago. A delayed
+    /// slot waits only for its own submission.
     ///
     /// `render_commands` is the command buffer from the preceding render pass.
     /// It is submitted together with the compute shader in a single
@@ -315,7 +331,7 @@ impl Nv12Converter {
     /// Call this in a loop after the frame loop ends to drain remaining
     /// frames. Returns `None` when no frames are pending.
     ///
-    /// Uses blocking poll since no new GPU work follows to overlap with.
+    /// Waits for the slot's submission when its mapping is still pending.
     #[cfg_attr(
         feature = "profiling",
         tracing::instrument(skip_all, name = "nv12_flush")
@@ -327,7 +343,7 @@ impl Nv12Converter {
         // Oldest pending slot: current_slot was already advanced, so walk
         // back by pending_count to find the oldest unread buffer.
         let read_slot = (self.current_slot + 3 - self.pending_count as usize) % 3;
-        self.readback_staging_blocking(gpu, read_slot)?;
+        self.readback_staging(gpu, read_slot)?;
         self.pending_count -= 1;
         Ok(Some(&self.readback_buffers[read_slot]))
     }
@@ -405,85 +421,76 @@ impl Nv12Converter {
             self.nv12_gpu_buffer.size(),
         );
 
+        let tx = self.readback_slots[slot].tx.clone();
+        encoder.map_buffer_on_submit(
+            &self.nv12_staging_buffers[slot],
+            wgpu::MapMode::Read,
+            ..,
+            move |result| {
+                let _ = tx.send(result);
+            },
+        );
+
         {
             crate::profile_scope!("nv12_submit");
-            gpu.queue.submit([render_commands, encoder.finish()]);
+            self.readback_slots[slot].submission =
+                Some(gpu.queue.submit([render_commands, encoder.finish()]));
         }
 
         Ok(())
     }
 
-    /// Read back data from a staging buffer using non-blocking poll.
-    ///
-    /// The buffer was submitted 2 frames ago, so it should already be complete.
-    /// Falls back to blocking poll as a safety net if the GPU hasn't finished.
     fn readback_staging(&mut self, gpu: &GpuContext, slot: usize) -> Result<(), Nv12Error> {
         crate::profile_scope!("nv12_readback");
-        let buffer_slice = self.nv12_staging_buffers[slot].slice(..);
-        let tx = self.map_tx.clone();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-
-        // Non-blocking poll: the GPU work for this buffer was submitted 2
-        // frames ago, so it should be complete.
         gpu.device
             .poll(wgpu::PollType::Poll)
             .map_err(|_| Nv12Error::BufferMapFailed)?;
-
-        // Check if map completed. Fall back to blocking if needed.
-        match self.map_rx.try_recv() {
-            Ok(result) => result.map_err(|_| Nv12Error::BufferMapFailed)?,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Safety net: block if the GPU somehow hasn't finished.
+        let result = match self.readback_slots[slot].rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                self.wait_count += 1;
+                let start = Instant::now();
+                let submission = self.readback_slots[slot]
+                    .submission
+                    .clone()
+                    .ok_or(Nv12Error::BufferMapFailed)?;
                 gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: Some(Duration::from_secs(5)),
+                    })
                     .map_err(|_| Nv12Error::BufferMapFailed)?;
-                self.map_rx
-                    .recv()
-                    .map_err(|_| Nv12Error::BufferMapFailed)?
+                let result = self.readback_slots[slot]
+                    .rx
+                    .recv_timeout(Duration::from_secs(1))
                     .map_err(|_| Nv12Error::BufferMapFailed)?;
+                self.wait_time += start.elapsed();
+                result
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(Nv12Error::BufferMapFailed);
-            }
-        }
-
-        let mapped = buffer_slice.get_mapped_range();
+            Err(mpsc::TryRecvError::Disconnected) => return Err(Nv12Error::BufferMapFailed),
+        };
+        result.map_err(|_| Nv12Error::BufferMapFailed)?;
+        let start = Instant::now();
+        let mapped = self.nv12_staging_buffers[slot].slice(..).get_mapped_range();
         self.readback_buffers[slot].copy_from_slice(&mapped);
         drop(mapped);
         self.nv12_staging_buffers[slot].unmap();
+        self.readback_slots[slot].submission = None;
+        self.copy_time += start.elapsed();
+        self.readback_count += 1;
         Ok(())
     }
 
-    /// Read back data from a staging buffer using blocking poll.
-    ///
-    /// Used by [`flush_pending`](Self::flush_pending) where no new GPU work
-    /// follows to overlap with, so we must wait for completion.
-    fn readback_staging_blocking(
-        &mut self,
-        gpu: &GpuContext,
-        slot: usize,
-    ) -> Result<(), Nv12Error> {
-        crate::profile_scope!("nv12_readback_blocking");
-        let buffer_slice = self.nv12_staging_buffers[slot].slice(..);
-        let tx = self.map_tx.clone();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|_| Nv12Error::BufferMapFailed)?;
-        self.map_rx
-            .recv()
-            .map_err(|_| Nv12Error::BufferMapFailed)?
-            .map_err(|_| Nv12Error::BufferMapFailed)?;
-
-        let mapped = buffer_slice.get_mapped_range();
-        self.readback_buffers[slot].copy_from_slice(&mapped);
-        drop(mapped);
-        self.nv12_staging_buffers[slot].unmap();
-        Ok(())
+    pub(crate) fn log_readback_stats(&self) {
+        if self.readback_count > 0 {
+            log::info!(
+                "NV12 readback: {} frames, {} bounded waits ({:.2}ms total), avg CPU copy {:.3}ms",
+                self.readback_count,
+                self.wait_count,
+                self.wait_time.as_secs_f64() * 1000.0,
+                self.copy_time.as_secs_f64() * 1000.0 / self.readback_count as f64,
+            );
+        }
     }
 
     /// Output width in pixels.
@@ -507,4 +514,87 @@ pub enum Nv12Error {
     /// Invalid output dimensions.
     #[error("invalid NV12 dimensions: {0}")]
     InvalidDimensions(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires GPU"]
+    fn gpu_nv12_readback_preserves_ring_order_and_short_session_flush() {
+        let gpu = GpuContext::new_blocking().unwrap();
+        let (width, height) = (68, 6);
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nv12_ring_test"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let mut converter = Nv12Converter::new(&gpu, width, height).unwrap();
+        let y_size = (width * height) as usize;
+        let mut value = 10_u8;
+        for frames in [1, 2, 8, 1] {
+            let mut expected = std::collections::VecDeque::new();
+            let mut actual = Vec::new();
+            for _ in 0..frames {
+                let gray = f64::from(value) / 255.0;
+                expected.push_back((16.0 + 219.0 * gray).round() as u8);
+                let mut commands = gpu.device.create_command_encoder(&Default::default());
+                {
+                    let _pass = commands.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: gray,
+                                    g: gray,
+                                    b: gray,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    });
+                }
+                if let Some(data) = converter
+                    .convert_and_readback(&gpu, &target, commands.finish())
+                    .unwrap()
+                {
+                    actual.push(data.to_vec());
+                }
+                value += 13;
+            }
+            while let Some(data) = converter.flush_pending(&gpu).unwrap() {
+                actual.push(data.to_vec());
+            }
+            assert!(converter.flush_pending(&gpu).unwrap().is_none());
+            assert_eq!(actual.len(), frames);
+            for data in actual {
+                let y = expected.pop_front().unwrap();
+                assert!(data[..y_size].iter().all(|v| v.abs_diff(y) <= 1));
+                assert!(data[y_size..].iter().all(|v| v.abs_diff(128) <= 1));
+            }
+            assert!(expected.is_empty());
+            assert!(
+                converter
+                    .readback_slots
+                    .iter()
+                    .all(|slot| slot.submission.is_none())
+            );
+        }
+        assert_eq!(converter.readback_count, 12);
+    }
 }

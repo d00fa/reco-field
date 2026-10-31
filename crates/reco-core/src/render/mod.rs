@@ -3,6 +3,10 @@
 //! Groups the modules responsible for turning decoded video frames into a
 //! stitched panoramic output on the GPU.
 
+mod blend;
+#[cfg(feature = "opencv-seam")]
+mod opencv_seam;
+pub mod panorama;
 pub mod pipeline;
 pub mod planes;
 pub mod renderer;

@@ -21,6 +21,8 @@ pub struct StitchArgs<'a> {
     pub right: &'a str,
     pub calibration: &'a str,
     pub output: &'a str,
+    pub projection: &'a str,
+    pub source_manifest: Option<&'a str>,
     pub width: u32,
     pub height: u32,
     pub blend: f32,
@@ -114,12 +116,26 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
             reco_io::stitch_job::InputPath::Single(std::path::PathBuf::from(s))
         }
     };
-    let mut job = reco_io::StitchJob::with_calibration(
-        to_input(args.left),
-        to_input(args.right),
-        cal,
-        args.output,
-    )
+    let mut job = if args.source_manifest.is_some() {
+        reco_io::StitchJob::new(
+            to_input(args.left),
+            to_input(args.right),
+            args.calibration,
+            args.output,
+        )
+    } else {
+        reco_io::StitchJob::with_calibration(
+            to_input(args.left),
+            to_input(args.right),
+            cal,
+            args.output,
+        )
+    }
+    .projection(match args.projection {
+        "panorama" => reco_core::render::viewport::OutputProjection::Panorama,
+        "perspective" => reco_core::render::viewport::OutputProjection::Perspective,
+        other => anyhow::bail!("Unknown output projection: {other}"),
+    })
     .codec(parse_codec(args.codec))
     .quality(parse_quality(args.quality))
     .resolution(args.width, args.height)
@@ -133,6 +149,9 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
 
     if let Some(t) = args.start_time {
         job = job.start_time(t);
+    }
+    if let Some(path) = args.source_manifest {
+        job = job.source_manifest(path);
     }
     if let Some(t) = args.end_time {
         job = job.end_time(t);
@@ -369,6 +388,9 @@ pub fn run_stitch(args: StitchArgs<'_>, interrupted: &Arc<AtomicBool>) -> anyhow
     }
 
     let result = job.run(interrupted)?;
+    if let Some(stats) = &result.source_sync {
+        println!("Source sync: {}", serde_json::to_string(stats)?);
+    }
 
     #[cfg(feature = "autocam")]
     if tracking_failed.load(std::sync::atomic::Ordering::Relaxed) {

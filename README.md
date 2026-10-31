@@ -1,4 +1,47 @@
-# Reco Video Stitcher
+# Reco Field
+
+A web-controlled panoramic sports-camera appliance for NVIDIA Jetson, built on
+[Reco Video Stitcher](https://github.com/reco-project/video-stitcher). Record a
+stitched panorama or both original camera views, stream to multiple destinations,
+calibrate the cameras, and manage phone-hotspot connectivity from your browser.
+
+**[Download packages](https://github.com/d00fa/reco-field/releases)** ·
+**[Install and upgrade](appliance/README.md)** ·
+**[Complete engineering write-up](docs/RECO-FIELD.md)** ·
+**[Change record](docs/RECO-FIELD-CHANGELOG.md)**
+
+The package targets **ARM64 Ubuntu 22.04 / JetPack 6** with NVIDIA OpenCV 4.8 and
+the Jetson camera stack. Hardware testing used an **Orin Nano Super 8 GB, dual
+IMX477 cameras and an NVMe SSD**. Recordings and video temporary files stay on
+the SSD. Each unit gets its own storage identity, Wi-Fi credentials and camera
+calibration; the package never clones these from the development unit.
+
+The appliance includes boot-time web control, OpenCV graph-cut seams and GPU
+multiband blending, cylindrical panoramas, independent camera recording and
+offline panorama export, multiple stream destinations, camera exposure and
+white-balance controls, measured lens calibration, and QR codes for camera Wi-Fi.
+Headless boot retains the desktop for recovery. No OS packages were purged.
+
+Future shipped changes must increment the appliance version, update its change
+record and produce a new `.deb`, corresponding source archive and checksums.
+Package upgrades retain recordings, calibration and network settings.
+
+This is an independent prototype, not a Veo product or an identical replacement.
+Physical lens calibration, outdoor sports image-quality tests, full-match
+endurance, a physical phone join and public-platform streaming still need
+validation. No compatible AI tracking model or microphone is configured in the
+appliance. The Orin Nano uses software H.264 encoding and has no NVENC encoder.
+The web interface has no login; use it on trusted local networks.
+
+The project retains the upstream **[AGPL-3.0-only license](LICENSE)** and history.
+See [third-party notices](appliance/THIRD_PARTY_NOTICES.md) for bundled components.
+
+---
+
+## Upstream Reco Video Stitcher
+
+The following is the original cross-platform engine documentation. Its optional
+desktop, OBS and AI capabilities are distinct from the appliance features above.
 
 **Open-source GPU-accelerated panoramic sports camera software. Desktop App with AI tracking, CLI, and OBS Plugin.**
 

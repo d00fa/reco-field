@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+case "$1" in
+  install|upgrade)
+    if [ -f /usr/lib/reco-field/deb_install.py ]; then
+      /usr/bin/python3 /usr/lib/reco-field/deb_install.py check-idle
+    fi
+    ;;
+esac

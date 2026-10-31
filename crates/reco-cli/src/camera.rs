@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reco_core::source::StereoFrame;
-use reco_io::gstreamer::camera::CameraConfig;
+use reco_io::gstreamer::camera::{CameraConfig, CameraControls};
 
 use crate::helpers;
 
@@ -23,9 +23,14 @@ use crate::helpers;
 /// EKF tracking and a ball-following director for automatic panning.
 /// Configuration for live camera stitching.
 pub struct CameraRunConfig<'a> {
+    pub projection: reco_core::render::viewport::OutputProjection,
     pub cam_config: CameraConfig,
+    pub controls: CameraControls,
     pub calibration: &'a str,
     pub output: &'a str,
+    pub no_panorama_file: bool,
+    pub preview_fps: Option<u32>,
+    pub source_recording: Option<reco_io::gstreamer::source_recording::SourceRecordingConfig>,
     pub width: u32,
     pub height: u32,
     pub blend: f32,
@@ -73,9 +78,14 @@ pub fn run_camera(
     interrupted: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let CameraRunConfig {
+        projection,
         cam_config,
+        controls,
         calibration,
         output,
+        no_panorama_file,
+        preview_fps,
+        source_recording,
         width,
         height,
         blend,
@@ -105,11 +115,46 @@ pub fn run_camera(
         !output.contains("://"),
         "Output path looks like a network URL ({output}). Only local file paths are supported.",
     );
+    anyhow::ensure!(
+        !no_panorama_file || stream_url.is_some(),
+        "preview-only capture requires --stream-url"
+    );
+    anyhow::ensure!(
+        source_recording.is_none() || (use_nvmm && !v4l2_direct),
+        "separate-camera recording requires Jetson NVMM capture"
+    );
+    anyhow::ensure!(
+        preview_fps.is_none_or(|fps| use_nvmm && fps > 0 && fps <= capture_fps),
+        "preview rate requires NVMM capture and must be in 1..=capture-fps"
+    );
+    anyhow::ensure!(
+        end_time.is_none_or(|seconds| seconds.is_finite() && seconds > 0.0),
+        "end time must be finite and positive"
+    );
+    if let Some(recording) = &source_recording {
+        recording
+            .validate(&cam_config)
+            .map_err(anyhow::Error::msg)?;
+    }
 
     let cal = reco_core::calibration::MatchCalibration::from_file(Path::new(calibration))?;
+    let source_recording = source_recording
+        .map(|recording| {
+            reco_io::gstreamer::source_recording::SourceRecording::create(
+                recording,
+                &cam_config,
+                &controls,
+                &cal,
+            )
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     let field_roi = cal.field_roi.clone();
+    #[cfg(not(feature = "autocam"))]
+    let _ = (detection_interval, tracking, &field_roi);
 
     let viewport = reco_core::render::viewport::ViewportConfig {
+        projection,
         width,
         height,
         blend_width: blend,
@@ -331,25 +376,29 @@ pub fn run_camera(
         quality_preset: out_quality.into(),
         quality: quality_value,
         preset,
-        container: out_format.into(),
-        gop_size: Some(60),
+        container: if no_panorama_file {
+            reco_io::ffmpeg::encoder::Container::Null
+        } else {
+            out_format.into()
+        },
+        gop_size: Some(preview_fps.unwrap_or(capture_fps).saturating_mul(2)),
         stream_url: stream_url.map(|s| s.to_string()),
         ..Default::default()
     };
 
-    let encoder = reco_io::adapters::FfmpegFileEncoder::new(
+    let mut encoder = reco_io::adapters::FfmpegFileEncoder::new(
         Path::new(output),
         width,
         height,
-        (capture_fps as i32, 1),
+        (preview_fps.unwrap_or(capture_fps) as i32, 1),
         &enc_config,
     )?;
+    encoder.use_realtime_timestamps();
     println!("Encoder: {}", encoder.encoder_name());
 
     session.set_encoder(Box::new(encoder), 2);
 
-    let frame_limit =
-        reco_core::session::types::compute_frame_limit(end_time, max_frames, capture_fps as f64);
+    let frame_limit = max_frames.unwrap_or(u64::MAX);
 
     if frame_limit < u64::MAX {
         println!("Capturing up to {frame_limit} frames");
@@ -357,6 +406,11 @@ pub fn run_camera(
 
     let start = std::time::Instant::now();
     let mut frame_count: u64 = 0;
+    let should_capture = |count| {
+        count < frame_limit
+            && !interrupted.load(Ordering::Relaxed)
+            && end_time.is_none_or(|seconds| start.elapsed().as_secs_f64() < seconds)
+    };
 
     if v4l2_direct {
         #[cfg(not(feature = "v4l2"))]
@@ -405,7 +459,7 @@ pub fn run_camera(
 
             let progress = helpers::ProgressReporter::new(30);
 
-            while frame_count < frame_limit && !interrupted.load(Ordering::Relaxed) {
+            while should_capture(frame_count) {
                 let (left_bytes, right_bytes) = {
                     reco_core::profile_scope!("wait_capture");
                     match source.next_pair()? {
@@ -504,140 +558,187 @@ pub fn run_camera(
             use reco_core::nvbuf_transform::NvBufDetectionSurface;
             use reco_io::gstreamer::camera::GstreamerNvmmCameraSource;
 
-            let mut source = GstreamerNvmmCameraSource::open(&cam_config)?;
+            let mut source = GstreamerNvmmCameraSource::open_with_recording(
+                &cam_config,
+                &controls,
+                source_recording,
+            )?;
 
-            // Detection surface size must match the TRT engine's input dims.
-            // All shipped yolo26 engines use 1280x1280.
             let model_size = 1280u32;
-            log::info!("NVMM detection surface size: {model_size}x{model_size}");
-            let mut det_left =
-                NvBufDetectionSurface::new(model_size, capture_width, capture_height)
-                    .map_err(|e| anyhow::anyhow!("left detection surface: {e}"))?;
-            let mut det_right =
-                NvBufDetectionSurface::new(model_size, capture_width, capture_height)
-                    .map_err(|e| anyhow::anyhow!("right detection surface: {e}"))?;
-
-            let det_surface_mb =
-                (det_left.pitch as f64 * model_size as f64 * 2.0) / 1024.0 / 1024.0;
-            let tensor_mb =
-                (model_size as f64 * model_size as f64 * 3.0 * 4.0 * 2.0) / 1024.0 / 1024.0;
-            let nvmm_buf_mb =
-                (capture_width as f64 * capture_height as f64 * 1.5 * 8.0) / 1024.0 / 1024.0;
-            log::info!(
-                "NVMM detection surfaces: {}x{} RGBA, letterbox scale={:.4}, pitch={}",
-                model_size,
-                model_size,
-                det_left.scale,
-                det_left.pitch,
-            );
-            log::info!(
-                "Memory budget: det_surfaces={:.1}MB, trt_tensors={:.1}MB, nvmm_bufs={:.1}MB",
-                det_surface_mb,
-                tensor_mb,
-                nvmm_buf_mb,
-            );
+            let mut detection_surfaces: Option<(NvBufDetectionSurface, NvBufDetectionSurface)> =
+                None;
 
             let mut dmabuf_cache = DmaBufTextureCache::new();
-
-            // Warmup: pull first pair to initialize ISP + Argus
-            let warmup = source
-                .next_pair()?
-                .ok_or_else(|| anyhow::anyhow!("NVMM source returned no frames"))?;
-            source.release_previous();
-            log::info!(
-                "NVMM warmup: {}x{} NV12, fd_left={}, fd_right={}",
-                warmup.left.width,
-                warmup.left.height,
-                warmup.left.dmabuf_fd,
-                warmup.right.dmabuf_fd,
-            );
-            log::info!("Warmup complete, starting NVMM capture");
-
+            let preview_period =
+                preview_fps.map(|fps| std::time::Duration::from_secs_f64(1.0 / f64::from(fps)));
+            let mut next_preview = std::time::Instant::now();
             let progress = helpers::ProgressReporter::new(30);
-
-            while frame_count < frame_limit && !interrupted.load(Ordering::Relaxed) {
-                let pair = {
-                    reco_core::profile_scope!("wait_capture");
-                    match source.next_pair()? {
-                        Some(p) => p,
-                        None => break,
-                    }
-                };
-
-                // Detection: NvBufSurfTransform on the raw NVMM surface pointers
-                if session.detection_should_run() {
-                    reco_core::profile_scope!("nvbuf_detect");
-                    unsafe {
-                        det_left
-                            .transform_from_nvmm(pair.left.surface_ptr)
-                            .map_err(|e| anyhow::anyhow!("left transform: {e}"))?;
-                        det_right
-                            .transform_from_nvmm(pair.right.surface_ptr)
-                            .map_err(|e| anyhow::anyhow!("right transform: {e}"))?;
-                    }
-                    session.detect_and_update_director_preletterboxed(
-                        det_left.data_ptr,
-                        det_right.data_ptr,
-                        capture_width,
-                        capture_height,
-                        start.elapsed(),
-                    )?;
-                } else {
-                    session.update_director(start.elapsed())?;
-                }
-
-                // Rendering: ensure DMA-buf textures are cached, then borrow both
-                {
-                    reco_core::profile_scope!("dmabuf_ensure_cached");
-                    dmabuf_cache
-                        .ensure_imported(
-                            session.gpu(),
-                            pair.left.dmabuf_fd,
-                            pair.left.width,
-                            pair.left.height,
-                            pair.left.y_offset,
-                            pair.left.uv_offset,
-                            pair.left.total_size,
-                        )
-                        .map_err(|e| anyhow::anyhow!("left DMA-buf import: {e}"))?;
-                    dmabuf_cache
-                        .ensure_imported(
-                            session.gpu(),
-                            pair.right.dmabuf_fd,
-                            pair.right.width,
-                            pair.right.height,
-                            pair.right.y_offset,
-                            pair.right.uv_offset,
-                            pair.right.total_size,
-                        )
-                        .map_err(|e| anyhow::anyhow!("right DMA-buf import: {e}"))?;
-                }
-                let left_textures = dmabuf_cache.get(pair.left.dmabuf_fd);
-                let right_textures = dmabuf_cache.get(pair.right.dmabuf_fd);
-
-                let pos = session.director_position();
-                {
-                    reco_core::profile_scope!("stitch_and_encode");
-                    session.process_frame_imported_nv12(
-                        &left_textures.y_texture,
-                        &left_textures.uv_texture,
-                        &right_textures.y_texture,
-                        &right_textures.uv_texture,
-                        pos.yaw,
-                        pos.pitch,
-                    )?;
-                }
-
+            let capture_result = (|| -> anyhow::Result<()> {
+                // Warmup: pull first pair to initialize ISP + Argus
+                let warmup = source
+                    .next_pair()?
+                    .ok_or_else(|| anyhow::anyhow!("NVMM source returned no frames"))?;
+                let left_color = warmup
+                    .left
+                    .input_colorimetry()
+                    .map_err(anyhow::Error::msg)?;
+                let right_color = warmup
+                    .right
+                    .input_colorimetry()
+                    .map_err(anyhow::Error::msg)?;
+                session
+                    .pipeline_mut()
+                    .set_input_colorimetry(left_color, right_color);
                 source.release_previous();
+                log::info!(
+                    "NVMM warmup: {}x{} NV12, fd_left={}, fd_right={}, left_color={left_color:?}, right_color={right_color:?}",
+                    warmup.left.width,
+                    warmup.left.height,
+                    warmup.left.dmabuf_fd,
+                    warmup.right.dmabuf_fd,
+                );
+                log::info!("Warmup complete, starting NVMM capture");
 
-                frame_count += 1;
-                progress.report(frame_count);
-            }
+                let mut phase_times = [std::time::Duration::ZERO; 3];
+                let mut timing_frames = 0_u64;
+                while should_capture(frame_count) {
+                    let capture_start = std::time::Instant::now();
+                    let pair = {
+                        reco_core::profile_scope!("wait_capture");
+                        match source.next_pair()? {
+                            Some(p) => p,
+                            None => break,
+                        }
+                    };
 
-            source.stop();
+                    if let Some(period) = preview_period {
+                        let now = std::time::Instant::now();
+                        if now < next_preview {
+                            source.release_previous();
+                            continue;
+                        }
+                        next_preview = now + period;
+                    }
+
+                    phase_times[0] += capture_start.elapsed();
+                    session.pipeline_mut().set_input_colorimetry(
+                        pair.left.input_colorimetry().map_err(anyhow::Error::msg)?,
+                        pair.right.input_colorimetry().map_err(anyhow::Error::msg)?,
+                    );
+
+                    let detection_start = std::time::Instant::now();
+                    // Detection: NvBufSurfTransform on the raw NVMM surface pointers
+                    if session.detection_should_run() {
+                        reco_core::profile_scope!("nvbuf_detect");
+                        if detection_surfaces.is_none() {
+                            let left = NvBufDetectionSurface::new(
+                                model_size,
+                                capture_width,
+                                capture_height,
+                            )
+                            .map_err(|e| anyhow::anyhow!("left detection surface: {e}"))?;
+                            let right = NvBufDetectionSurface::new(
+                                model_size,
+                                capture_width,
+                                capture_height,
+                            )
+                            .map_err(|e| anyhow::anyhow!("right detection surface: {e}"))?;
+                            log::info!(
+                                "NVMM detection surfaces initialized: {model_size}x{model_size}, pitch={}",
+                                left.pitch
+                            );
+                            detection_surfaces = Some((left, right));
+                        }
+                        let (det_left, det_right) = detection_surfaces.as_mut().unwrap();
+                        unsafe {
+                            det_left
+                                .transform_from_nvmm(pair.left.surface_ptr)
+                                .map_err(|e| anyhow::anyhow!("left transform: {e}"))?;
+                            det_right
+                                .transform_from_nvmm(pair.right.surface_ptr)
+                                .map_err(|e| anyhow::anyhow!("right transform: {e}"))?;
+                        }
+                        session.detect_and_update_director_preletterboxed(
+                            det_left.data_ptr,
+                            det_right.data_ptr,
+                            capture_width,
+                            capture_height,
+                            start.elapsed(),
+                        )?;
+                    } else {
+                        session.update_director(start.elapsed())?;
+                    }
+
+                    phase_times[1] += detection_start.elapsed();
+                    let import_start = std::time::Instant::now();
+                    // Rendering: ensure DMA-buf textures are cached, then borrow both
+                    {
+                        reco_core::profile_scope!("dmabuf_ensure_cached");
+                        dmabuf_cache
+                            .ensure_imported(
+                                session.gpu(),
+                                pair.left.dmabuf_fd,
+                                pair.left.width,
+                                pair.left.height,
+                                pair.left.y_offset,
+                                pair.left.uv_offset,
+                                pair.left.total_size,
+                            )
+                            .map_err(|e| anyhow::anyhow!("left DMA-buf import: {e}"))?;
+                        dmabuf_cache
+                            .ensure_imported(
+                                session.gpu(),
+                                pair.right.dmabuf_fd,
+                                pair.right.width,
+                                pair.right.height,
+                                pair.right.y_offset,
+                                pair.right.uv_offset,
+                                pair.right.total_size,
+                            )
+                            .map_err(|e| anyhow::anyhow!("right DMA-buf import: {e}"))?;
+                    }
+                    phase_times[2] += import_start.elapsed();
+                    let left_textures = dmabuf_cache.get(pair.left.dmabuf_fd);
+                    let right_textures = dmabuf_cache.get(pair.right.dmabuf_fd);
+
+                    let pos = session.director_position();
+                    {
+                        reco_core::profile_scope!("stitch_and_encode");
+                        session.process_frame_imported_nv12(
+                            &left_textures.y_texture,
+                            &left_textures.uv_texture,
+                            &right_textures.y_texture,
+                            &right_textures.uv_texture,
+                            pos.yaw,
+                            pos.pitch,
+                        )?;
+                    }
+
+                    source.release_previous();
+
+                    frame_count += 1;
+                    progress.report(frame_count);
+                    timing_frames += 1;
+                    if timing_frames == 300 {
+                        report_nvmm_cpu_timings(&session, &phase_times, timing_frames);
+                        phase_times.fill(std::time::Duration::ZERO);
+                        timing_frames = 0;
+                    }
+                }
+
+                if timing_frames > 0 {
+                    report_nvmm_cpu_timings(&session, &phase_times, timing_frames);
+                }
+                Ok(())
+            })();
+            let capture_error = capture_result.as_ref().err().map(ToString::to_string);
+            let source_result = source.finish(capture_error.as_deref());
             #[cfg(feature = "replay")]
             session.clear_stacked_gpu_recorder();
-            session.finish()?;
+            let encoder_result = session.finish();
+            capture_result?;
+            source_result?;
+            encoder_result?;
 
             progress.finish(frame_count, output);
         }
@@ -646,7 +747,10 @@ pub fn run_camera(
         anyhow::bail!("NVMM zero-copy is only available on Linux/Jetson");
     } else if use_nv12_capture {
         // NV12 path: skip nvvidconv format conversion, upload 2 planes
-        let mut source = reco_io::gstreamer::camera::GstreamerNv12CameraSource::open(&cam_config)?;
+        let mut source = reco_io::gstreamer::camera::GstreamerNv12CameraSource::open_with_controls(
+            &cam_config,
+            &controls,
+        )?;
 
         // Warm up: discard first frame (camera ISP + pipeline init)
         if let Some(pair) = source.next_pair()? {
@@ -659,7 +763,7 @@ pub fn run_camera(
 
         let progress = helpers::ProgressReporter::new(30);
 
-        while frame_count < frame_limit && !interrupted.load(Ordering::Relaxed) {
+        while should_capture(frame_count) {
             let pair = {
                 reco_core::profile_scope!("wait_capture");
                 match source.next_pair()? {
@@ -689,11 +793,14 @@ pub fn run_camera(
     } else {
         // I420 path: standard YUV420P upload with 3 planes
         use reco_core::source::FrameSource;
-        let mut source = reco_io::gstreamer::camera::GstreamerCameraSource::open(&cam_config)?;
+        let mut source = reco_io::gstreamer::camera::GstreamerCameraSource::open_with_controls(
+            &cam_config,
+            &controls,
+        )?;
 
         let progress = helpers::ProgressReporter::new(30);
 
-        while frame_count < frame_limit && !interrupted.load(Ordering::Relaxed) {
+        while should_capture(frame_count) {
             let frame = {
                 reco_core::profile_scope!("wait_capture");
                 match source.next_frame()? {
@@ -717,6 +824,25 @@ pub fn run_camera(
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn report_nvmm_cpu_timings(
+    session: &reco_core::session::StitchSession,
+    phases: &[std::time::Duration; 3],
+    frames: u64,
+) {
+    let snapshot = session.telemetry_snapshot();
+    let ms = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / frames as f64;
+    log::info!(
+        "NVMM CPU phase averages: capture/pair wait={:.3}ms, detection/director={:.3}ms, import={:.3}ms; recent render commands={:.3}ms, NV12 submit/readback={:.3}ms, encode enqueue={:.3}ms (not GPU execution times)",
+        ms(phases[0]),
+        ms(phases[1]),
+        ms(phases[2]),
+        snapshot.avg_stitch_ms,
+        snapshot.avg_readback_ms,
+        snapshot.avg_submit_ms,
+    );
 }
 
 fn nv12_to_yuv(
@@ -782,15 +908,22 @@ impl reco_calibrate::live::LiveFramePairSource for Nv12CameraCalibSource {
     }
 }
 
+/// Optional lens profiles supplied to live calibration.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CalibrationProfiles<'a> {
+    pub left: Option<&'a str>,
+    pub right: Option<&'a str>,
+}
+
 /// Run live calibration from camera feeds.
 pub fn run_live_calibrate(
     cam_config: CameraConfig,
+    controls: CameraControls,
     output_path: &str,
     capture_width: u32,
     capture_height: u32,
     num_pairs: usize,
-    left_profile: Option<&str>,
-    right_profile: Option<&str>,
+    profiles: CalibrationProfiles<'_>,
     interrupted: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     use reco_core::calibration::CameraParams;
@@ -828,14 +961,19 @@ pub fn run_live_calibrate(
             d: [0.0; 4],
         })
     };
-    let left_params = load_or_default(left_profile, capture_width, capture_height)?;
-    let right_params = load_or_default(right_profile, capture_width, capture_height)
-        .unwrap_or_else(|_| left_params.clone());
+    let left_params = load_or_default(profiles.left, capture_width, capture_height)?;
+    let right_params = match profiles.right {
+        Some(path) => load_or_default(Some(path), capture_width, capture_height)?,
+        None => left_params.clone(),
+    };
 
     let gpu = reco_core::gpu::GpuContext::new_blocking()?;
     eprintln!("GPU: {}", gpu.gpu_name());
 
-    let source = reco_io::gstreamer::camera::GstreamerNv12CameraSource::open(&cam_config)?;
+    let source = reco_io::gstreamer::camera::GstreamerNv12CameraSource::open_with_controls(
+        &cam_config,
+        &controls,
+    )?;
     eprintln!("Cameras open, warming up ISP...");
 
     let mut calib_source = Nv12CameraCalibSource {

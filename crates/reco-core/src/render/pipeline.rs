@@ -22,9 +22,10 @@
 //! )?;
 //! ```
 
+use super::panorama::{PanoramaBounds, PanoramaGeometry};
 use super::renderer::{InputFormat, RenderError, Renderer};
 use super::scene::SceneGeometry;
-use super::viewport::{ResolvedViewport, ViewportConfig};
+use super::viewport::{OutputProjection, ResolvedViewport, ViewportConfig};
 use crate::calibration::MatchCalibration;
 use crate::detect::director::ViewportPosition;
 use crate::gpu::{GpuContext, GpuError};
@@ -126,7 +127,22 @@ impl StitchPipeline {
         let output_format = output_format.into();
         let aspect = calibration.left.width as f32 / calibration.left.height as f32;
         let scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, aspect);
-        let renderer = Renderer::new(
+        let panorama = if viewport.projection == OutputProjection::Panorama {
+            Some(
+                PanoramaGeometry::fit(&scene, &calibration, &viewport)
+                    .map_err(|reason| PipelineError::InvalidConfig { reason })?,
+            )
+        } else {
+            None
+        };
+        if let Some(panorama) = &panorama {
+            log::info!(
+                "Panorama coverage: horizontal={:.2} vertical={:.2} degrees",
+                panorama.bounds.horizontal_degrees(),
+                panorama.bounds.vertical_degrees()
+            );
+        }
+        let mut renderer = Renderer::new(
             &gpu,
             viewport.width,
             viewport.height,
@@ -136,6 +152,7 @@ impl StitchPipeline {
             input_format,
             &scene,
         );
+        renderer.panorama = panorama;
 
         log::info!(
             "Pipeline initialized: {}x{} output, GPU: {}",
@@ -176,6 +193,29 @@ impl StitchPipeline {
     /// The current output viewport configuration.
     pub fn viewport(&self) -> &ViewportConfig {
         &self.viewport
+    }
+
+    /// Fitted coverage for fixed panoramic output, or None for perspective.
+    pub fn panorama_bounds(&self) -> Option<PanoramaBounds> {
+        self.renderer.panorama.as_ref().map(|p| p.bounds)
+    }
+
+    fn refit_panorama(
+        &mut self,
+        scene: &SceneGeometry,
+        calibration: &MatchCalibration,
+        viewport: &ViewportConfig,
+    ) -> bool {
+        if viewport.projection == OutputProjection::Panorama {
+            match PanoramaGeometry::fit(scene, calibration, viewport) {
+                Ok(panorama) => self.renderer.panorama = Some(panorama),
+                Err(error) => {
+                    log::warn!("Panorama geometry update rejected: {error}");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Input frame dimensions as `(width, height)`.
@@ -227,8 +267,13 @@ impl StitchPipeline {
             log::warn!("resize({width}, {height}) ignored: dimensions must be non-zero");
             return None;
         }
-        self.viewport.width = width;
-        self.viewport.height = height;
+        let mut viewport = self.viewport.clone();
+        viewport.width = width;
+        viewport.height = height;
+        if !self.refit_panorama(&self.scene.clone(), &self.calibration.clone(), &viewport) {
+            return None;
+        }
+        self.viewport = viewport;
         Some((width, height))
     }
 
@@ -247,7 +292,23 @@ impl StitchPipeline {
 
     /// Set the lens distortion correction amount for the stitch view.
     pub fn set_lens_correction_amount(&mut self, amount: f32) {
-        self.viewport.lens_correction_amount = amount.clamp(0.0, 1.0);
+        let mut viewport = self.viewport.clone();
+        viewport.lens_correction_amount = amount.clamp(0.0, 1.0);
+        if self.refit_panorama(&self.scene.clone(), &self.calibration.clone(), &viewport) {
+            self.viewport = viewport;
+        }
+    }
+
+    /// Update the corrected rig frame and refit fixed panorama coverage.
+    pub fn set_rig_orientation(&mut self, tilt: f32, roll: f32) {
+        let viewport = ViewportConfig {
+            rig_tilt: tilt,
+            rig_roll: roll,
+            ..self.viewport.clone()
+        };
+        if self.refit_panorama(&self.scene.clone(), &self.calibration.clone(), &viewport) {
+            self.viewport = viewport;
+        }
     }
 
     /// Update calibration parameters. Recomputes [`SceneGeometry`] from the
@@ -257,7 +318,11 @@ impl StitchPipeline {
     /// No GPU pipeline recreation needed - only the uniform data changes.
     pub fn update_calibration(&mut self, calibration: MatchCalibration) {
         let aspect = calibration.left.width as f32 / calibration.left.height as f32;
-        self.scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, aspect);
+        let scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, aspect);
+        if !self.refit_panorama(&scene, &calibration, &self.viewport.clone()) {
+            return;
+        }
+        self.scene = scene;
         self.calibration = calibration;
         log::debug!("Pipeline calibration updated");
     }
@@ -298,12 +363,17 @@ impl StitchPipeline {
         if left.is_none() && right.is_none() {
             return;
         }
+        let mut calibration = self.calibration.clone();
         if let Some(l) = left {
-            self.calibration.left = l;
+            calibration.left = l;
         }
         if let Some(r) = right {
-            self.calibration.right = r;
+            calibration.right = r;
         }
+        if !self.refit_panorama(&self.scene.clone(), &calibration, &self.viewport.clone()) {
+            return;
+        }
+        self.calibration = calibration;
         log::debug!("Pipeline camera params updated");
     }
 
@@ -752,6 +822,16 @@ impl StitchPipeline {
 
     pub fn set_full_range(&mut self, full_range: bool) {
         self.renderer.set_full_range(full_range);
+    }
+
+    /// Apply independently reported camera colour metadata before rendering.
+    /// This only updates uniforms; geometry and GPU textures are unchanged.
+    pub fn set_input_colorimetry(
+        &mut self,
+        left: super::renderer::InputColorimetry,
+        right: super::renderer::InputColorimetry,
+    ) {
+        self.renderer.set_input_colorimetry(left, right);
     }
 
     /// Access the rendered RGBA texture for NV12 conversion.

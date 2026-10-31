@@ -12,7 +12,7 @@ use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use std::ptr;
 
-use super::encoder::EncodeError;
+use super::encoder::{EncodeError, VAAPI_PIXEL};
 
 /// CPU staging pixel format for a given encoder input format.
 ///
@@ -21,7 +21,7 @@ use super::encoder::EncodeError;
 /// format. Map VAAPI to its NV12 `sw_format`; every other format is its
 /// own staging format.
 pub(super) fn staging_pixel_format(encoder_pixel_format: Pixel) -> Pixel {
-    if encoder_pixel_format == Pixel::VAAPI {
+    if encoder_pixel_format == VAAPI_PIXEL {
         Pixel::NV12
     } else {
         encoder_pixel_format
@@ -66,7 +66,7 @@ impl HardwareUpload {
                 return Err(ffmpeg::Error::Unknown.into());
             }
 
-            (*frames_ctx).format = Pixel::VAAPI.into();
+            (*frames_ctx).format = VAAPI_PIXEL.into();
             (*frames_ctx).sw_format = Pixel::NV12.into();
             (*frames_ctx).width = width as i32;
             (*frames_ctx).height = height as i32;
@@ -123,6 +123,10 @@ impl HardwareUpload {
             }
         }
         frame.set_pts(source.pts());
+        frame.set_color_space(source.color_space());
+        frame.set_color_range(source.color_range());
+        frame.set_color_primaries(source.color_primaries());
+        frame.set_color_transfer_characteristic(source.color_transfer_characteristic());
         Ok(frame)
     }
 }

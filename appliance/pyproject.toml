@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reco-field"
+version = "0.2.0"
+description = "Local operator service for the Reco Field Jetson appliance"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi==0.162.0",
+  "uvicorn==0.54.0",
+  "qrcode==8.2",
+  "pypng==0.20220715.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx==0.28.1",
+  "pytest==9.2.0",
+]
+
+[project.scripts]
+reco-field = "reco_field.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["reco_field*"]
+
+[tool.setuptools.package-data]
+reco_field = ["mediamtx.yml", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

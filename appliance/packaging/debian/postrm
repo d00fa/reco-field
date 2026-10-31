@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+# Runtime releases and per-unit state are retained, including on purge.
+case "$1" in
+  remove|purge)
+    if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+    ;;
+esac

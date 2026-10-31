@@ -425,6 +425,7 @@ impl StitchSession {
         for mut enc in self.extra_encoders.drain(..) {
             enc.finish()?;
         }
+        self.nv12_converter.log_readback_stats();
 
         Ok(())
     }

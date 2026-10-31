@@ -591,6 +591,25 @@ impl VideoDecoder {
         self.is_full_range
     }
 
+    /// Declared YCbCr coefficients supported by the stitching renderer.
+    /// Unknown/unsupported matrices remain unknown rather than being guessed.
+    pub fn input_colorimetry(&self) -> Option<reco_core::render::renderer::InputColorimetry> {
+        use reco_core::render::renderer::{InputColorimetry, YuvMatrix};
+        let stream = self.input.stream(self.video_stream_index)?;
+        let parameters = stream.parameters();
+        let matrix = match unsafe { (*parameters.as_ptr()).color_space } {
+            ffi::AVColorSpace::AVCOL_SPC_BT709 => YuvMatrix::Bt709,
+            ffi::AVColorSpace::AVCOL_SPC_BT470BG | ffi::AVColorSpace::AVCOL_SPC_SMPTE170M => {
+                YuvMatrix::Bt601
+            }
+            _ => return None,
+        };
+        Some(InputColorimetry {
+            matrix,
+            full_range: self.is_full_range,
+        })
+    }
+
     /// Rotation from stream metadata (0, 90, 180, 270 degrees).
     ///
     /// The CPU decode path applies this by reversing buffers in `extract_yuv`.
@@ -1005,12 +1024,17 @@ impl VideoDecoder {
         let frame_format = cpu_frame.format();
 
         // Get or create scaler if needed
-        let source = if frame_format != Pixel::YUV420P {
+        let target_format = match frame_format {
+            Pixel::YUVJ422P | Pixel::YUVJ444P => Pixel::YUVJ420P,
+            _ => Pixel::YUV420P,
+        };
+        // YUVJ420P has the same planes; converting it would silently shrink full-range luma.
+        let source = if !matches!(frame_format, Pixel::YUV420P | Pixel::YUVJ420P) {
             let needs_new_scaler = self.scaler.is_none()
                 || self
                     .scaler
                     .as_ref()
-                    .is_some_and(|_| self.converted_frame.format() != Pixel::YUV420P);
+                    .is_some_and(|_| self.converted_frame.format() != target_format);
 
             if needs_new_scaler {
                 log::debug!(
@@ -1024,7 +1048,7 @@ impl VideoDecoder {
                         frame_format,
                         self.width,
                         self.height,
-                        Pixel::YUV420P,
+                        target_format,
                         self.width,
                         self.height,
                         ScalingFlags::POINT,
@@ -1433,6 +1457,27 @@ mod tests {
         assert_eq!(dec.frame_rate(), R60);
     }
 
+    #[test]
+    fn mjpeg_full_range_ramp_keeps_black_white_and_midtones() {
+        ffmpeg::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.mov");
+        write_mjpeg_60fps(&path);
+        let mut decoder = super::VideoDecoder::open(&path).unwrap();
+        assert!(decoder.is_full_range());
+        let frame = decoder.next_frame().unwrap().unwrap();
+        for (block, expected) in [0u8, 32, 64, 96, 128, 160, 208, 255]
+            .into_iter()
+            .enumerate()
+        {
+            let actual = frame.y[32 * 64 + block * 8 + 4];
+            assert!(
+                actual.abs_diff(expected) <= 2,
+                "full-range level {expected} became {actual}"
+            );
+        }
+    }
+
     fn write_mjpeg_60fps(path: &std::path::Path) {
         use ffmpeg::codec;
 
@@ -1458,6 +1503,13 @@ mod tests {
         let mut frame = ffmpeg::util::frame::Video::new(ffmpeg::format::Pixel::YUVJ420P, 64, 64);
         for plane in 0..3 {
             frame.data_mut(plane).fill(128);
+        }
+        let stride = frame.stride(0);
+        for row in 0..64 {
+            for (block, value) in [0, 32, 64, 96, 128, 160, 208, 255].into_iter().enumerate() {
+                frame.data_mut(0)[row * stride + block * 8..row * stride + (block + 1) * 8]
+                    .fill(value);
+            }
         }
         for i in 0..6 {
             frame.set_pts(Some(i));

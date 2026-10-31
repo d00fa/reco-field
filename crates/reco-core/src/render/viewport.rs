@@ -7,9 +7,21 @@
 
 use crate::detect::director::ViewportPosition;
 
+/// Geometry used to present the calibrated camera pair.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputProjection {
+    /// A movable rectilinear crop, compatible with the tracking director.
+    #[default]
+    Perspective,
+    /// The widest covered cylindrical panorama that fits the output aspect.
+    Panorama,
+}
+
 /// Configuration for the output viewport.
 #[derive(Debug, Clone)]
 pub struct ViewportConfig {
+    /// Output projection. Perspective preserves existing callers' behaviour.
+    pub projection: OutputProjection,
     /// Output width in pixels.
     pub width: u32,
     /// Output height in pixels.
@@ -22,12 +34,10 @@ pub struct ViewportConfig {
     pub fov_degrees: f32,
     /// Seam blend width in UV space (0.0–1.0).
     ///
-    /// Controls how much of the right plane's left edge fades in over the
-    /// left plane using a smoothstep alpha gradient. `0.0` = hard seam,
-    /// `0.15` = blend over 15% of the plane width. Default: 0.05 (tight
-    /// crossfade — the small value matches the live-production tests on
-    /// Jetson CSI IMX477, larger blends wash out ball tracking in the
-    /// overlap region).
+    /// Width of the right plane's transition mask. `0.0` selects a hard
+    /// seam; `0.15` spans 15% of the plane width. Multiband blending keeps
+    /// fine details on a tighter transition than illumination, and valid
+    /// sole-camera pixels stay opaque. Default: 0.05.
     pub blend_width: f32,
     /// Rig tilt in radians (forward lean from vertical).
     ///
@@ -53,6 +63,7 @@ pub struct ViewportConfig {
 impl Default for ViewportConfig {
     fn default() -> Self {
         Self {
+            projection: OutputProjection::Perspective,
             width: 1920,
             height: 1080,
             fov_degrees: 75.0,

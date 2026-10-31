@@ -36,6 +36,9 @@ pub mod output;
 pub mod smart_source;
 
 #[cfg(feature = "ffmpeg")]
+pub mod source_bundle;
+
+#[cfg(feature = "ffmpeg")]
 pub mod stitch_job;
 
 #[cfg(feature = "ffmpeg")]

@@ -39,3 +39,6 @@ calibration_adjusted.json
 
 # Logs
 *.log
+
+# Local hardware session notes (public product documentation lives in docs/RECO-FIELD*).
+/docs/agent-work/

@@ -414,11 +414,13 @@ impl StitchRenderer {
     }
 
     pub fn set_rig_tilt(&mut self, radians: f32) {
-        self.pipeline.viewport.rig_tilt = radians;
+        self.pipeline
+            .set_rig_orientation(radians, self.pipeline.viewport.rig_roll);
     }
 
     pub fn set_rig_roll(&mut self, radians: f32) {
-        self.pipeline.viewport.rig_roll = radians;
+        self.pipeline
+            .set_rig_orientation(self.pipeline.viewport.rig_tilt, radians);
     }
 
     /// Access the current calibration (for saving after adjustments).

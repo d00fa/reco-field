@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+case "$1" in
+  configure) /usr/bin/python3 /usr/lib/reco-field/deb_install.py configure ;;
+esac

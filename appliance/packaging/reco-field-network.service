@@ -1,0 +1,27 @@
+[Unit]
+Description=Reco Field Wi-Fi setup and hotspot recovery
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/reco-field/current/network_service.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+RuntimeDirectory=reco-field-network
+RuntimeDirectoryMode=0750
+StateDirectory=reco-field-network
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/etc/NetworkManager/system-connections /var/lib/reco-field-network /run/reco-field-network
+
+[Install]
+WantedBy=multi-user.target

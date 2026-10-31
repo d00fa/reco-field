@@ -1,0 +1,36 @@
+[Unit]
+Description=Reco Field loopback MediaMTX relay
+After=network.target
+RequiresMountsFor=/var/lib/reco-field
+
+[Service]
+Type=simple
+User=recofield
+Group=recofield
+UMask=0077
+Environment=GOMEMLIMIT=512MiB
+Environment=RECO_FIELD_DATA_DIR=/var/lib/reco-field
+Environment=MTX_HLSDIRECTORY=/var/lib/reco-field/tmp/hls
+EnvironmentFile=/etc/reco-field/reco-field.env
+ExecStartPre=/opt/reco-field/current/venv/bin/python -m reco_field init
+ExecStartPre=/usr/bin/mkdir -p /var/lib/reco-field/tmp/hls
+ExecStart=/opt/reco-field/current/bin/mediamtx /etc/reco-field/mediamtx.yml
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateTmp=yes
+# SSD identity checks need device metadata; device I/O remains blocked.
+PrivateDevices=no
+DevicePolicy=closed
+ReadWritePaths=/var/lib/reco-field
+
+[Install]
+WantedBy=multi-user.target

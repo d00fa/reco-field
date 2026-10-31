@@ -76,6 +76,13 @@ pub struct DetectRegion {
 /// still being faster than raw 4K/5K input.
 const DETECT_MAX_WIDTH: u32 = 1920;
 
+fn detection_scale(width: u32, height: u32) -> f32 {
+    let pixels = width as f64 * height as f64;
+    (DETECT_MAX_WIDTH as f64 / width.max(1) as f64)
+        .min((1920.0 * 1080.0 / pixels.max(1.0)).sqrt())
+        .min(1.0) as f32
+}
+
 /// Detect features and compute descriptors using AKAZE.
 ///
 /// Convenience wrapper that calls [`detect_with_border`] with the default
@@ -195,10 +202,11 @@ pub fn detect_with_border(
     let dynamic = image::DynamicImage::ImageRgb8(img);
 
     // Downscale if needed for performance
-    let (detect_img, scale) = if detect_w > DETECT_MAX_WIDTH {
-        let s = DETECT_MAX_WIDTH as f32 / detect_w as f32;
-        let new_w = DETECT_MAX_WIDTH;
-        let new_h = (detect_h as f32 * s) as u32;
+    // Tall overlap crops also need a pixel cap: AKAZE's scale space can exhaust a Jetson's RAM.
+    let s = detection_scale(detect_w, detect_h);
+    let (detect_img, scale) = if s < 1.0 {
+        let new_w = ((detect_w as f32 * s) as u32).max(1);
+        let new_h = ((detect_h as f32 * s) as u32).max(1);
         let resized = dynamic.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
         log::debug!(
             "downscaled {}x{} -> {}x{} for AKAZE",
@@ -425,6 +433,19 @@ pub fn match_descriptors(left: &[Descriptor], right: &[Descriptor], ratio: f64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_scale_bounds_tall_overlap_memory() {
+        for (width, height) in [(2048, 2800), (4032, 3040), (3840, 2160), (800, 600)] {
+            let scale = detection_scale(width, height);
+            let scaled_width = (width as f32 * scale) as u32;
+            let scaled_height = (height as f32 * scale) as u32;
+            assert!(scaled_width <= DETECT_MAX_WIDTH);
+            assert!(scaled_width as u64 * scaled_height as u64 <= 1920 * 1080);
+            assert!(scale > 0.0 && scale <= 1.0);
+        }
+        assert_eq!(detection_scale(800, 600), 1.0);
+    }
 
     #[test]
     fn hamming_distance_identical_is_zero() {

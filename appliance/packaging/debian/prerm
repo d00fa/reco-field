@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+case "$1" in
+  remove|deconfigure)
+    /usr/bin/python3 /usr/lib/reco-field/deb_install.py remove
+    ;;
+esac

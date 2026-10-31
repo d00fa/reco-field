@@ -11,6 +11,8 @@
 
 use std::ffi::c_void;
 
+use reco_core::render::renderer::{InputColorimetry, YuvMatrix};
+
 const NVBUF_MAX_PLANES: usize = 4;
 const STRUCTURE_PADDING: usize = 4;
 
@@ -76,6 +78,8 @@ pub(crate) struct NvBufSurface {
 /// Extracted metadata from an NVMM buffer for zero-copy rendering + detection.
 #[derive(Debug)]
 pub struct NvmmFrameInfo {
+    /// NvBufSurfaceColorFormat value reported by the producer.
+    pub color_format: u32,
     /// DMA-buf file descriptor for Vulkan import (rendering path).
     pub dmabuf_fd: i32,
     /// Frame width in pixels.
@@ -95,6 +99,24 @@ pub struct NvmmFrameInfo {
     /// Raw NvBufSurface pointer for NvBufSurfTransform (detection path).
     /// Valid only while the GStreamer sample is held.
     pub surface_ptr: *mut c_void,
+}
+
+impl NvmmFrameInfo {
+    /// Decode the JetPack surface's matrix/range, rejecting unsupported formats.
+    pub fn input_colorimetry(&self) -> Result<InputColorimetry, String> {
+        let (matrix, full_range) = match self.color_format {
+            6 => (YuvMatrix::Bt601, false),
+            7 => (YuvMatrix::Bt601, true),
+            33 => (YuvMatrix::Bt709, false),
+            34 => (YuvMatrix::Bt709, true),
+            format => {
+                return Err(format!(
+                    "unsupported NvBufSurface color_format={format}; expected NV12 BT.601 (6/7) or BT.709 (33/34)"
+                ));
+            }
+        };
+        Ok(InputColorimetry { matrix, full_range })
+    }
 }
 
 // SAFETY: surface_ptr is a stable kernel-managed address (NVMM pool buffer).
@@ -133,7 +155,8 @@ pub unsafe fn extract_nvmm_frame_info(mapped_data: *const u8) -> Result<NvmmFram
     let total_size = params.plane_params.offset[1]
         + params.plane_params.pitch[1] * params.plane_params.height[1];
 
-    Ok(NvmmFrameInfo {
+    let info = NvmmFrameInfo {
+        color_format: params.color_format,
         dmabuf_fd: params.buffer_desc as i32,
         width: params.width,
         height: params.height,
@@ -143,5 +166,62 @@ pub unsafe fn extract_nvmm_frame_info(mapped_data: *const u8) -> Result<NvmmFram
         uv_pitch: params.plane_params.pitch[1],
         total_size,
         surface_ptr: mapped_data as *mut c_void,
-    })
+    };
+    info.input_colorimetry()?;
+    Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extraction_preserves_surface_color_format() {
+        // Both C structs contain only integers and nullable pointers.
+        let mut params: NvBufSurfaceParams = unsafe { std::mem::zeroed() };
+        params.color_format = 6;
+        params.width = 64;
+        params.height = 32;
+        params.plane_params.num_planes = 2;
+        params.plane_params.pitch = [64, 64, 0, 0];
+        params.plane_params.offset = [0, 2048, 0, 0];
+        params.plane_params.height = [32, 16, 0, 0];
+        let mut surface: NvBufSurface = unsafe { std::mem::zeroed() };
+        surface.mem_type = NVBUF_MEM_SURFACE_ARRAY;
+        surface.num_filled = 1;
+        surface.surface_list = &mut params;
+
+        let mut info =
+            unsafe { extract_nvmm_frame_info((&surface as *const NvBufSurface).cast::<u8>()) }
+                .unwrap();
+        assert_eq!(info.color_format, 6);
+        assert_eq!((info.width, info.height, info.total_size), (64, 32, 3072));
+
+        for (format, matrix, full_range) in [
+            (6, YuvMatrix::Bt601, false),
+            (7, YuvMatrix::Bt601, true),
+            (33, YuvMatrix::Bt709, false),
+            (34, YuvMatrix::Bt709, true),
+        ] {
+            info.color_format = format;
+            assert_eq!(
+                info.input_colorimetry().unwrap(),
+                InputColorimetry { matrix, full_range }
+            );
+        }
+
+        for format in [0, 19, 36, u32::MAX] {
+            info.color_format = format;
+            assert!(
+                info.input_colorimetry()
+                    .unwrap_err()
+                    .contains(&format.to_string())
+            );
+            params.color_format = format;
+            surface.surface_list = &mut params;
+            let result =
+                unsafe { extract_nvmm_frame_info((&surface as *const NvBufSurface).cast::<u8>()) };
+            assert!(result.unwrap_err().contains(&format.to_string()));
+        }
+    }
 }

@@ -10,10 +10,20 @@ use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
 use ffmpeg::{Rational, codec, encoder, format};
+use std::ffi::{CString, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::hw_upload::{HardwareUpload, staging_pixel_format};
+
+/// FFmpeg 4.x names the opaque VAAPI surface format `VAAPI_VLD`; 5.0+
+/// renamed it to `VAAPI`.
+#[cfg(reco_ffmpeg_vaapi_vld)]
+pub(super) const VAAPI_PIXEL: Pixel = Pixel::VAAPI_VLD;
+#[cfg(not(reco_ffmpeg_vaapi_vld))]
+pub(super) const VAAPI_PIXEL: Pixel = Pixel::VAAPI;
 
 /// Errors from the video encoder.
 #[derive(Debug, Error)]
@@ -111,7 +121,7 @@ const H264_ENCODERS: &[EncoderCandidate] = &[
     EncoderCandidate {
         name: "h264_vaapi",
         is_hardware: true,
-        pixel_format: Pixel::VAAPI,
+        pixel_format: VAAPI_PIXEL,
     },
     EncoderCandidate {
         name: "h264_v4l2m2m",
@@ -131,7 +141,7 @@ const H264_ENCODERS: &[EncoderCandidate] = &[
     EncoderCandidate {
         name: "libx264",
         is_hardware: false,
-        pixel_format: Pixel::YUV420P,
+        pixel_format: Pixel::NV12,
     },
 ];
 
@@ -160,7 +170,7 @@ const HEVC_ENCODERS: &[EncoderCandidate] = &[
     EncoderCandidate {
         name: "hevc_vaapi",
         is_hardware: true,
-        pixel_format: Pixel::VAAPI,
+        pixel_format: VAAPI_PIXEL,
     },
     EncoderCandidate {
         name: "hevc_v4l2m2m",
@@ -204,7 +214,7 @@ const AV1_ENCODERS: &[EncoderCandidate] = &[
     EncoderCandidate {
         name: "av1_vaapi",
         is_hardware: true,
-        pixel_format: Pixel::VAAPI,
+        pixel_format: VAAPI_PIXEL,
     },
     EncoderCandidate {
         name: "libsvtav1",
@@ -355,6 +365,8 @@ pub enum Container {
     /// FLV container for RTMP streaming. Required by most RTMP
     /// ingest endpoints (YouTube, Twitch).
     Flv,
+    /// Discard the local muxed output while retaining the optional stream output.
+    Null,
 }
 
 impl Container {
@@ -364,6 +376,7 @@ impl Container {
             Self::Mp4 | Self::Mp4Fragmented => "mp4",
             Self::Matroska => "matroska",
             Self::Flv => "flv",
+            Self::Null => "null",
         }
     }
 
@@ -491,6 +504,9 @@ pub struct VideoEncoder {
     encoder_time_base: Rational,
     output_time_base: Rational,
     frame_count: i64,
+    realtime: bool,
+    first_frame_time: Option<std::time::Instant>,
+    last_pts: i64,
     width: u32,
     height: u32,
     finished: bool,
@@ -508,10 +524,121 @@ pub struct VideoEncoder {
 /// State for a secondary RTMP stream output that receives cloned packets
 /// from the primary encode pass.
 struct StreamOutput {
+    // The context closes its AVIO before the callback's boxed state is freed.
     octx: format::context::Output,
+    deadline: Box<StreamDeadline>,
     video_index: usize,
     video_time_base: Rational,
     audio: Option<SilentAudio>,
+}
+
+const STREAM_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+const STREAM_IO_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct StreamDeadline {
+    origin: Instant,
+    deadline_ns: AtomicU64,
+    aborted: AtomicBool,
+}
+
+impl StreamDeadline {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            deadline_ns: AtomicU64::new(STREAM_STARTUP_TIMEOUT.as_nanos() as u64),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self, timeout: Duration) {
+        let deadline = self
+            .origin
+            .elapsed()
+            .as_nanos()
+            .saturating_add(timeout.as_nanos());
+        self.deadline_ns
+            .store(deadline.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+
+    fn interrupted(&self) -> bool {
+        if self.aborted.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.origin.elapsed().as_nanos() >= u128::from(self.deadline_ns.load(Ordering::Relaxed))
+        {
+            self.abort();
+            return true;
+        }
+        false
+    }
+}
+
+unsafe extern "C" fn stream_interrupt(opaque: *mut c_void) -> std::ffi::c_int {
+    // FFmpeg retains this pointer only while StreamOutput owns the boxed state.
+    let Some(deadline) = (unsafe { opaque.cast::<StreamDeadline>().as_ref() }) else {
+        return 1;
+    };
+    i32::from(deadline.interrupted())
+}
+
+impl StreamOutput {
+    fn check_io(&self) -> Result<(), ffmpeg::Error> {
+        let error = unsafe {
+            let pb = (*self.octx.as_ptr()).pb;
+            if pb.is_null() { 0 } else { (*pb).error }
+        };
+        if error < 0 {
+            return Err(ffmpeg::Error::from(error));
+        }
+        if self.deadline.interrupted() {
+            return Err(ffmpeg::Error::Exit);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), ffmpeg::Error> {
+        self.deadline.arm(STREAM_IO_TIMEOUT);
+        unsafe {
+            let pb = (*self.octx.as_mut_ptr()).pb;
+            if !pb.is_null() {
+                ffmpeg::sys::avio_flush(pb);
+            }
+        }
+        self.check_io()
+    }
+
+    fn write_packet(
+        &mut self,
+        mut packet: ffmpeg::Packet,
+        source_time_base: Rational,
+    ) -> Result<(), EncodeError> {
+        self.deadline.arm(STREAM_IO_TIMEOUT);
+        packet.set_stream(self.video_index);
+        packet.rescale_ts(source_time_base, self.video_time_base);
+        let video_pts = packet.pts().unwrap_or(0);
+        packet.write_interleaved(&mut self.octx)?;
+        if let Some(audio) = &mut self.audio {
+            audio.write_up_to(&mut self.octx, video_pts, self.video_time_base)?;
+        }
+        self.check_io()?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), ffmpeg::Error> {
+        self.deadline.arm(STREAM_IO_TIMEOUT);
+        self.octx.write_trailer()?;
+        self.check_io()
+    }
+}
+
+impl Drop for StreamOutput {
+    fn drop(&mut self) {
+        self.deadline.abort();
+    }
 }
 
 /// Generates silent AAC frames to satisfy RTMP ingest audio requirements.
@@ -654,6 +781,20 @@ impl VideoEncoder {
                 Container::Matroska | Container::Flv => {
                     format::output_as(path, config.container.muxer_name())?
                 }
+                Container::Null => unsafe {
+                    // ffmpeg-next's output_as opens a file even for AVFMT_NOFILE muxers.
+                    let mut context = std::ptr::null_mut();
+                    let result = ffmpeg::sys::avformat_alloc_output_context2(
+                        &mut context,
+                        std::ptr::null_mut(),
+                        c"null".as_ptr(),
+                        std::ptr::null(),
+                    );
+                    if result < 0 {
+                        return Err(ffmpeg::Error::from(result).into());
+                    }
+                    format::context::Output::wrap(context)
+                },
             };
 
             match Self::try_open(
@@ -744,6 +885,9 @@ impl VideoEncoder {
                         encoder_time_base,
                         output_time_base,
                         frame_count: 0,
+                        realtime: false,
+                        first_frame_time: None,
+                        last_pts: -1,
                         width,
                         height,
                         finished: false,
@@ -783,7 +927,9 @@ impl VideoEncoder {
         config: &EncoderConfig,
         name: &str,
     ) -> Result<OpenedVideoEncoder, EncodeError> {
-        let needs_global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
+        // The secondary FLV needs codec setup data even when the primary muxer discards packets.
+        let needs_global_header = config.stream_url.is_some()
+            || octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
         let mut ost = octx.add_stream(codec)?;
         let stream_index = ost.index();
@@ -795,6 +941,13 @@ impl VideoEncoder {
         enc.set_width(width);
         enc.set_height(height);
         enc.set_format(pixel_fmt);
+        enc.set_colorspace(ffmpeg::color::Space::BT709);
+        enc.set_color_range(ffmpeg::color::Range::MPEG);
+        // These context fields are available in FFmpeg 4.4 and newer.
+        unsafe {
+            (*enc.as_mut_ptr()).color_primaries = ffmpeg::color::Primaries::BT709.into();
+            (*enc.as_mut_ptr()).color_trc = ffmpeg::color::TransferCharacteristic::BT709.into();
+        }
         enc.set_frame_rate(Some(fps));
         let encoder_time_base = Rational(fps.1, fps.0);
         enc.set_time_base(encoder_time_base);
@@ -814,7 +967,7 @@ impl VideoEncoder {
             enc.set_threading(ffmpeg::threading::Config::count(0));
         }
 
-        let hardware_upload = if pixel_fmt == Pixel::VAAPI {
+        let hardware_upload = if pixel_fmt == VAAPI_PIXEL {
             let upload = HardwareUpload::new_vaapi(width, height)?;
             // SAFETY: `enc` is a live, not-yet-opened encoder context.
             let codec_ctx = unsafe { enc.as_mut_ptr() };
@@ -858,7 +1011,7 @@ impl VideoEncoder {
         let output_time_base = Rational(0, 0); // placeholder, updated after write_header
 
         let staging_pixel_fmt = staging_pixel_format(pixel_fmt);
-        let scaler = ScalingContext::get(
+        let mut scaler = ScalingContext::get(
             Pixel::RGBA,
             width,
             height,
@@ -867,6 +1020,25 @@ impl VideoEncoder {
             height,
             ScalingFlags::BILINEAR,
         )?;
+        // Keep the CPU fallback consistent with rgba_to_nv12.wgsl.
+        let color_result = unsafe {
+            // Bindgen's macro integer type varies between FFmpeg header versions.
+            #[allow(clippy::unnecessary_cast)]
+            let coefficients = ffmpeg::sys::sws_getCoefficients(ffmpeg::sys::SWS_CS_ITU709 as i32);
+            ffmpeg::sys::sws_setColorspaceDetails(
+                scaler.as_mut_ptr(),
+                coefficients,
+                1,
+                coefficients,
+                0,
+                0,
+                1 << 16,
+                1 << 16,
+            )
+        };
+        if color_result < 0 {
+            return Err(ffmpeg::Error::from(color_result).into());
+        }
 
         Ok((
             encoder,
@@ -1021,65 +1193,109 @@ impl VideoEncoder {
         primary_video_index: usize,
         fps: Rational,
     ) -> Result<StreamOutput, EncodeError> {
-        let mut octx = format::output_as(url, "flv")?;
+        let url_c = CString::new(url).map_err(|_| ffmpeg::Error::InvalidData)?;
+        let mut raw = std::ptr::null_mut();
+        let result = unsafe {
+            ffmpeg::sys::avformat_alloc_output_context2(
+                &mut raw,
+                std::ptr::null_mut(),
+                c"flv".as_ptr(),
+                url_c.as_ptr(),
+            )
+        };
+        if result < 0 || raw.is_null() {
+            if !raw.is_null() {
+                unsafe {
+                    ffmpeg::sys::avformat_free_context(raw);
+                }
+            }
+            return Err(if result < 0 {
+                ffmpeg::Error::from(result)
+            } else {
+                ffmpeg::Error::Unknown
+            }
+            .into());
+        }
+        let mut stream = StreamOutput {
+            octx: unsafe { format::context::Output::wrap(raw) },
+            deadline: Box::new(StreamDeadline::new()),
+            video_index: 0,
+            video_time_base: Rational(0, 1),
+            audio: None,
+        };
+        unsafe {
+            (*raw).interrupt_callback = ffmpeg::sys::AVIOInterruptCB {
+                callback: Some(stream_interrupt),
+                opaque: (&*stream.deadline as *const StreamDeadline)
+                    .cast_mut()
+                    .cast(),
+            };
+        }
 
         let primary_video = primary_octx
             .stream(primary_video_index)
             .ok_or_else(|| EncodeError::CodecNotFound("primary video stream missing".into()))?;
-
         let params = primary_video.parameters();
         let extradata_len = unsafe { (*params.as_ptr()).extradata_size };
         log::info!("Stream output: copying H.264 params (extradata={extradata_len} bytes)");
         if extradata_len == 0 {
-            log::warn!(
-                "Stream output: H.264 extradata is empty - FLV header will \
-                 lack SPS/PPS, YouTube will likely reject the stream"
-            );
+            log::warn!("Stream output: H.264 extradata is empty; FLV header lacks SPS/PPS");
         }
-
-        let mut ost = octx.add_stream(ffmpeg::encoder::find(codec::Id::None))?;
+        let mut ost = stream
+            .octx
+            .add_stream(ffmpeg::encoder::find(codec::Id::None))?;
         ost.set_parameters(params);
         unsafe {
             (*ost.parameters().as_mut_ptr()).codec_tag = 0;
         }
-        let video_index = ost.index();
+        stream.video_index = ost.index();
+        stream.audio = Some(SilentAudio::new(&mut stream.octx)?);
 
-        let silent_audio = SilentAudio::new(&mut octx)?;
-
-        octx.write_header()?;
-
-        let video_time_base = octx
-            .stream(video_index)
+        // output_as opens AVIO with no interrupt callback, so connect explicitly.
+        stream.deadline.arm(STREAM_STARTUP_TIMEOUT);
+        let result = unsafe {
+            ffmpeg::sys::avio_open2(
+                &mut (*raw).pb,
+                url_c.as_ptr(),
+                ffmpeg::sys::AVIO_FLAG_WRITE,
+                &(*raw).interrupt_callback,
+                std::ptr::null_mut(),
+            )
+        };
+        if result < 0 {
+            return Err(ffmpeg::Error::from(result).into());
+        }
+        stream.octx.write_header()?;
+        stream.video_time_base = stream
+            .octx
+            .stream(stream.video_index)
             .expect("stream we just added")
             .time_base();
-
-        let mut silent_audio = {
-            let mut sa = silent_audio;
-            if let Some(s) = octx.stream(sa.stream_index) {
-                sa.output_time_base = s.time_base();
-            }
-            sa
-        };
-
-        // Pre-write one frame of silent audio so YouTube sees audio
-        // before the first video packet arrives. RTMP ingest servers
-        // expect interleaved A/V from the start.
-        let one_frame_duration = ffmpeg::Rational(fps.1, fps.0);
-        let preroll_pts = unsafe {
-            ffmpeg::sys::av_rescale_q(1, one_frame_duration.into(), video_time_base.into())
-        };
-        if let Err(e) = silent_audio.write_up_to(&mut octx, preroll_pts, video_time_base) {
-            log::warn!("Stream audio preroll failed: {e}");
+        if let Some(audio) = &mut stream.audio {
+            audio.output_time_base = stream
+                .octx
+                .stream(audio.stream_index)
+                .expect("audio stream we just added")
+                .time_base();
+            let preroll_pts = unsafe {
+                ffmpeg::sys::av_rescale_q(
+                    1,
+                    Rational(fps.1, fps.0).into(),
+                    stream.video_time_base.into(),
+                )
+            };
+            audio.write_up_to(&mut stream.octx, preroll_pts, stream.video_time_base)?;
         }
-
-        log::info!("Stream output ready: {url} (video tb={video_time_base}, fps={fps})");
-
-        Ok(StreamOutput {
-            octx,
-            video_index,
-            video_time_base,
-            audio: Some(silent_audio),
-        })
+        // Keep header and initial AAC within the same startup deadline.
+        unsafe {
+            ffmpeg::sys::avio_flush((*raw).pb);
+        }
+        stream.check_io()?;
+        log::info!(
+            "Stream output ready: {url} (video tb={}, fps={fps})",
+            stream.video_time_base
+        );
+        Ok(stream)
     }
 
     /// Forward audio packets up to the given video duration limit.
@@ -1174,8 +1390,28 @@ impl VideoEncoder {
         Ok(())
     }
 
+    /// Preserve elapsed capture time when live frames are dropped or delayed.
+    pub fn use_realtime_timestamps(&mut self) {
+        self.realtime = true;
+    }
+
     fn send_current_yuv_frame(&mut self) -> Result<(), EncodeError> {
-        self.yuv_frame.set_pts(Some(self.frame_count));
+        let pts = if self.realtime {
+            let start = self
+                .first_frame_time
+                .get_or_insert_with(std::time::Instant::now);
+            seconds_to_pts(start.elapsed().as_secs_f64(), self.encoder_time_base)
+                .max(self.last_pts + 1)
+        } else {
+            self.frame_count
+        };
+        self.yuv_frame.set_pts(Some(pts));
+        self.yuv_frame.set_color_space(ffmpeg::color::Space::BT709);
+        self.yuv_frame.set_color_range(ffmpeg::color::Range::MPEG);
+        self.yuv_frame
+            .set_color_primaries(ffmpeg::color::Primaries::BT709);
+        self.yuv_frame
+            .set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
         if let Some(ref mut upload) = self.hardware_upload {
             let frame = upload.upload(&self.yuv_frame)?;
             self.encoder.send_frame(frame)?;
@@ -1184,6 +1420,7 @@ impl VideoEncoder {
         }
         self.receive_and_write_packets()?;
 
+        self.last_pts = pts;
         self.frame_count += 1;
         Ok(())
     }
@@ -1308,8 +1545,8 @@ impl VideoEncoder {
     /// drift from repeated range conversion.
     ///
     /// Adapts to the encoder's staging pixel format: writes separate
-    /// U and V planes for YUV420P (software encoders), or interleaves
-    /// the chroma into a single UV plane for NV12 (hardware encoders,
+    /// U and V planes for YUV420P, or interleaves
+    /// the chroma into a single UV plane for NV12 (including libx264 and hardware encoders,
     /// including the VAAPI path, whose NV12 staging frame is then
     /// uploaded to a GPU surface before encoding).
     #[cfg_attr(
@@ -1363,8 +1600,7 @@ impl VideoEncoder {
         }
 
         if self.yuv_frame.format() == Pixel::NV12 {
-            // Hardware encoders (NVENC, AMF, VT): interleave U+V
-            // into a single UV plane. ~0.3ms for 1080p.
+            // Planar callers interleave U+V for NV12 staging.
             let uv_stride = self.yuv_frame.stride(1);
             let dst = self.yuv_frame.data_mut(1);
             for row in 0..chroma_h {
@@ -1377,7 +1613,7 @@ impl VideoEncoder {
                 }
             }
         } else {
-            // Software encoders (libx264): separate U and V planes.
+            // Planar staging keeps separate U and V planes.
             for (plane_idx, src) in [(1usize, u), (2, v)] {
                 let stride = self.yuv_frame.stride(plane_idx);
                 if stride == chroma_w {
@@ -1427,15 +1663,16 @@ impl VideoEncoder {
             let pb = (*self.octx.as_mut_ptr()).pb;
             if !pb.is_null() {
                 ffmpeg::sys::avio_flush(pb);
-            }
-        }
-        if let Some(ref mut stream) = self.stream {
-            unsafe {
-                let pb = (*stream.octx.as_mut_ptr()).pb;
-                if !pb.is_null() {
-                    ffmpeg::sys::avio_flush(pb);
+                if (*pb).error < 0 {
+                    return Err(ffmpeg::Error::from((*pb).error).into());
                 }
             }
+        }
+        if let Some(stream) = &mut self.stream
+            && let Err(error) = stream.flush()
+        {
+            log::warn!("Secondary stream flush failed ({error}), disabling stream");
+            self.stream = None;
         }
         Ok(())
     }
@@ -1469,15 +1706,15 @@ impl VideoEncoder {
             self.forward_audio_packets_until(video_duration_pts)?;
         }
 
-        // Finalize stream output (non-fatal).
+        self.octx.write_trailer()?;
+
         if let Some(ref mut stream) = self.stream
-            && let Err(e) = stream.octx.write_trailer()
+            && let Err(e) = stream.finish()
         {
             log::warn!("RTMP stream finalization failed: {e}");
         }
         self.stream = None;
 
-        self.octx.write_trailer()?;
         Ok(())
     }
 
@@ -1508,29 +1745,16 @@ impl VideoEncoder {
                 packet.set_duration(one_frame.max(1));
             }
 
-            // Clone for stream BEFORE primary write (write_interleaved unrefs the packet).
-            if let Some(ref mut stream) = self.stream {
-                let mut clone = packet.clone();
-                clone.set_stream(stream.video_index);
-                clone.rescale_ts(self.output_time_base, stream.video_time_base);
-                // Save PTS before write_interleaved blanks the packet
-                // (av_interleaved_write_frame resets all fields to defaults).
-                let video_pts = clone.pts().unwrap_or(0);
-                if let Err(e) = clone.write_interleaved(&mut stream.octx) {
-                    log::warn!("RTMP stream write failed ({e}), disabling stream");
-                    self.stream = None;
-                } else if let Some(ref mut sa) = stream.audio {
-                    // Write silent audio to keep up with video PTS.
-                    if let Err(e) =
-                        sa.write_up_to(&mut stream.octx, video_pts, stream.video_time_base)
-                    {
-                        log::warn!("Silent audio write failed ({e}), continuing without audio");
-                        stream.audio = None;
-                    }
-                }
-            }
-
+            // Primary write unrefs the packet; retain only a cheap secondary reference.
+            let secondary = self.stream.as_ref().map(|_| packet.clone());
             packet.write_interleaved(&mut self.octx)?;
+            if let Some(stream) = &mut self.stream
+                && let Some(packet) = secondary
+                && let Err(error) = stream.write_packet(packet, self.output_time_base)
+            {
+                log::warn!("Secondary stream write failed ({error}), disabling stream");
+                self.stream = None;
+            }
         }
         Ok(())
     }
@@ -1606,7 +1830,7 @@ impl SilentAudio {
         );
         frame.set_rate(sample_rate);
 
-        // Zero-fill (silence). Audio frames default to zero.
+        Self::clear_frame(&mut frame)?;
         let output_time_base = Rational(0, 0); // updated after write_header
 
         Ok(Self {
@@ -1618,6 +1842,18 @@ impl SilentAudio {
             samples_per_frame,
             sample_rate,
         })
+    }
+
+    fn clear_frame(frame: &mut ffmpeg::frame::Audio) -> Result<(), EncodeError> {
+        let result = unsafe { ffmpeg::sys::av_frame_make_writable(frame.as_mut_ptr()) };
+        if result < 0 {
+            return Err(ffmpeg::Error::from(result).into());
+        }
+        // Planar audio only defines linesize[0]; typed planes cover every sample.
+        for plane in 0..frame.planes() {
+            frame.plane_mut::<f32>(plane).fill(0.0);
+        }
+        Ok(())
     }
 
     /// Write enough silent audio frames to stay ahead of the given video PTS.
@@ -1637,6 +1873,7 @@ impl SilentAudio {
         };
 
         while self.next_pts < video_samples {
+            Self::clear_frame(&mut self.frame)?;
             self.frame.set_pts(Some(self.next_pts));
             self.encoder.send_frame(&self.frame)?;
             self.next_pts += self.samples_per_frame as i64;
@@ -1927,6 +2164,578 @@ fn build_encoder_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StalledTcpSink {
+        address: std::net::SocketAddr,
+        stop: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StalledTcpSink {
+        fn new() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, receiver) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let end = Instant::now() + Duration::from_secs(15);
+                loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            // A watchdog closes the peer even if the writer regresses and hangs.
+                            let _ = receiver
+                                .recv_timeout(end.saturating_duration_since(Instant::now()));
+                            let _ = socket.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if receiver.try_recv().is_ok() || Instant::now() >= end {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                address,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn close(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for StalledTcpSink {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    fn stream_test_encoder(path: &Path, url: String, width: u32, height: u32) -> VideoEncoder {
+        VideoEncoder::new(
+            path,
+            width,
+            height,
+            Rational(30, 1),
+            &EncoderConfig {
+                encoder_name: Some("libx264".into()),
+                preset: Some("ultrafast".into()),
+                container: Container::Matroska,
+                stream_url: Some(url),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn video_packet_count(path: &Path) -> usize {
+        let mut input = format::input(path).unwrap();
+        let index = input
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .unwrap()
+            .index();
+        input
+            .packets()
+            .filter(|(stream, _)| stream.index() == index)
+            .count()
+    }
+
+    #[test]
+    fn secondary_deadline_interrupt_is_sticky_and_accepts_null_safely() {
+        let deadline = StreamDeadline::new();
+        let opaque = (&deadline as *const StreamDeadline).cast_mut().cast();
+        assert_eq!(unsafe { stream_interrupt(std::ptr::null_mut()) }, 1);
+        assert_eq!(unsafe { stream_interrupt(opaque) }, 0);
+        deadline.arm(Duration::ZERO);
+        assert_eq!(unsafe { stream_interrupt(opaque) }, 1);
+        deadline.arm(STREAM_STARTUP_TIMEOUT);
+        assert_eq!(unsafe { stream_interrupt(opaque) }, 1);
+    }
+
+    #[test]
+    fn secondary_rtmp_startup_timeout_preserves_primary_recording() {
+        let sink = StalledTcpSink::new();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("no-rtmp-handshake.mkv");
+        let started = Instant::now();
+        let mut encoder =
+            stream_test_encoder(&path, format!("rtmp://{}/live/test", sink.address), 64, 64);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "test must reach the stalled RTMP handshake"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "startup took {:?}",
+            started.elapsed()
+        );
+        assert!(encoder.stream.is_none());
+        for _ in 0..3 {
+            encoder
+                .write_nv12_frame(&vec![128; 64 * 64 * 3 / 2])
+                .unwrap();
+        }
+        encoder.finish().unwrap();
+        assert_eq!(video_packet_count(&path), 3);
+    }
+
+    #[test]
+    fn secondary_tcp_write_stall_disables_stream_and_preserves_all_primary_frames() {
+        let sink = StalledTcpSink::new();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("stalled-secondary.mkv");
+        let mut encoder = stream_test_encoder(&path, format!("tcp://{}", sink.address), 1280, 720);
+        assert!(encoder.stream.is_some());
+        let mut pixels = vec![0; 1280 * 720 * 3 / 2];
+        let mut random = 0x12345678_u32;
+        let mut longest_write = Duration::ZERO;
+        let write_start = Instant::now();
+        let mut stream_failed_at = None;
+        for _ in 0..40 {
+            for pixel in &mut pixels {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *pixel = random as u8;
+            }
+            let started = Instant::now();
+            encoder.write_nv12_frame(&pixels).unwrap();
+            longest_write = longest_write.max(started.elapsed());
+            if encoder.stream.is_none() && stream_failed_at.is_none() {
+                stream_failed_at = Some(write_start.elapsed());
+            }
+        }
+        assert!(
+            encoder.stream.is_none(),
+            "test must fill the stalled peer's socket buffers"
+        );
+        assert!(
+            stream_failed_at.unwrap() < Duration::from_secs(5),
+            "deadline must interrupt before the socket watchdog"
+        );
+        assert!(
+            longest_write < Duration::from_secs(3),
+            "one write took {longest_write:?}"
+        );
+        let started = Instant::now();
+        encoder.flush_to_disk().unwrap();
+        encoder.finish().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(video_packet_count(&path), 40);
+    }
+
+    #[test]
+    fn secondary_disconnect_flush_and_drop_leave_primary_valid() {
+        let mut sink = StalledTcpSink::new();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("disconnected-secondary.mkv");
+        let mut encoder = stream_test_encoder(&path, format!("tcp://{}", sink.address), 64, 64);
+        assert!(encoder.stream.is_some());
+        encoder
+            .write_nv12_frame(&vec![128; 64 * 64 * 3 / 2])
+            .unwrap();
+        sink.close();
+        let stream = encoder.stream.as_mut().unwrap();
+        stream.deadline.arm(STREAM_IO_TIMEOUT);
+        let payload = vec![0; 1024 * 1024];
+        let started = Instant::now();
+        unsafe {
+            let pb = (*stream.octx.as_mut_ptr()).pb;
+            ffmpeg::sys::avio_write(pb, payload.as_ptr(), payload.len() as i32);
+        }
+        encoder.flush_to_disk().unwrap();
+        assert!(encoder.stream.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "flush/drop took {:?}",
+            started.elapsed()
+        );
+        encoder
+            .write_nv12_frame(&vec![128; 64 * 64 * 3 / 2])
+            .unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(video_packet_count(&path), 2);
+    }
+
+    #[test]
+    fn null_muxer_encodes_without_creating_or_truncating_a_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        for existing in [false, true] {
+            let path = temporary
+                .path()
+                .join(if existing { "keep.mkv" } else { "absent.mkv" });
+            if existing {
+                std::fs::write(&path, b"preserve existing recording").unwrap();
+            }
+            let mut encoder = VideoEncoder::new(
+                &path,
+                64,
+                64,
+                Rational(30, 1),
+                &EncoderConfig {
+                    encoder_name: Some("libx264".into()),
+                    preset: Some("ultrafast".into()),
+                    container: Container::Null,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for _ in 0..3 {
+                encoder
+                    .write_nv12_frame(&vec![128; 64 * 64 * 3 / 2])
+                    .unwrap();
+            }
+            encoder.finish().unwrap();
+            if existing {
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    b"preserve existing recording"
+                );
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn null_primary_secondary_flv_has_decodable_video_and_audio() {
+        let temporary = tempfile::tempdir().unwrap();
+        let absent = temporary.path().join("must-not-exist.mkv");
+        let flv = temporary.path().join("secondary.flv");
+        let mut encoder = VideoEncoder::new(
+            &absent,
+            64,
+            64,
+            Rational(30, 1),
+            &EncoderConfig {
+                encoder_name: Some("libx264".into()),
+                preset: Some("ultrafast".into()),
+                container: Container::Null,
+                stream_url: Some(flv.to_str().unwrap().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let secondary = encoder.stream.as_ref().expect("secondary must open");
+        let parameters = secondary
+            .octx
+            .stream(secondary.video_index)
+            .unwrap()
+            .parameters();
+        assert!(unsafe { (*parameters.as_ptr()).extradata_size } > 0);
+        assert!(secondary.audio.is_some());
+        for _ in 0..12 {
+            encoder
+                .write_nv12_frame(&vec![128; 64 * 64 * 3 / 2])
+                .unwrap();
+        }
+        assert!(encoder.stream.is_some(), "secondary must remain healthy");
+        encoder.finish().unwrap();
+        drop(encoder);
+        assert!(!absent.exists());
+
+        let mut input = format::input(&flv).unwrap();
+        let video = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+        let video_index = video.index();
+        assert_eq!(video.parameters().id(), codec::Id::H264);
+        let mut video_decoder = codec::context::Context::from_parameters(video.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        let audio = input.streams().best(ffmpeg::media::Type::Audio).unwrap();
+        let audio_index = audio.index();
+        assert_eq!(audio.parameters().id(), codec::Id::AAC);
+        let mut audio_decoder = codec::context::Context::from_parameters(audio.parameters())
+            .unwrap()
+            .decoder()
+            .audio()
+            .unwrap();
+        let mut video_frame = VideoFrame::empty();
+        let mut audio_frame = ffmpeg::frame::Audio::empty();
+        let mut video_frames = 0;
+        let mut audio_frames = 0;
+        for (stream, packet) in input.packets() {
+            if stream.index() == video_index {
+                video_decoder.send_packet(&packet).unwrap();
+                while video_decoder.receive_frame(&mut video_frame).is_ok() {
+                    video_frames += 1;
+                }
+            } else if stream.index() == audio_index {
+                audio_decoder.send_packet(&packet).unwrap();
+                while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
+                    audio_frames += 1;
+                }
+            }
+        }
+        video_decoder.send_eof().unwrap();
+        while video_decoder.receive_frame(&mut video_frame).is_ok() {
+            video_frames += 1;
+        }
+        audio_decoder.send_eof().unwrap();
+        while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
+            audio_frames += 1;
+        }
+        assert_eq!(video_frames, 12);
+        assert!(audio_frames > 0);
+    }
+
+    #[test]
+    fn high_quality_keeps_crf_when_ultrafast_is_explicit() {
+        let opts = build_encoder_opts(
+            "libx264",
+            Quality::High,
+            None,
+            Some("ultrafast"),
+            1920,
+            1080,
+        );
+        assert_eq!(opts.get("preset"), Some("ultrafast"));
+        assert_eq!(opts.get("crf"), Some("23"));
+    }
+
+    #[test]
+    fn encoded_nv12_has_bt709_limited_color_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("color.mkv");
+        let mut encoder = VideoEncoder::new(
+            &path,
+            64,
+            64,
+            Rational(30, 1),
+            &EncoderConfig {
+                encoder_name: Some("libx264".into()),
+                container: Container::Matroska,
+                quality_preset: Quality::High,
+                preset: Some("ultrafast".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut nv12 = vec![128; 64 * 64 * 3 / 2];
+        nv12[..64 * 64].fill(16);
+        encoder.write_nv12_frame(&nv12).unwrap();
+        encoder.finish().unwrap();
+
+        let mut input = format::input(&path).unwrap();
+        let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+        let index = stream.index();
+        let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+            .unwrap()
+            .decoder()
+            .video()
+            .unwrap();
+        for (stream, packet) in input.packets() {
+            if stream.index() == index {
+                decoder.send_packet(&packet).unwrap();
+            }
+        }
+        decoder.send_eof().unwrap();
+        let mut frame = ffmpeg::frame::Video::empty();
+        decoder.receive_frame(&mut frame).unwrap();
+        assert_eq!(frame.color_space(), ffmpeg::color::Space::BT709);
+        assert_eq!(frame.color_range(), ffmpeg::color::Range::MPEG);
+        assert_eq!(frame.color_primaries(), ffmpeg::color::Primaries::BT709);
+        assert_eq!(
+            frame.color_transfer_characteristic(),
+            ffmpeg::color::TransferCharacteristic::BT709
+        );
+    }
+
+    #[test]
+    fn libx264_nv12_and_planar_inputs_roundtrip_chroma_and_frame_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let colors = [[63_u8, 102, 240], [173, 42, 26], [32, 240, 118]];
+        for planar in [false, true] {
+            let path = temporary.path().join(format!("chroma-{planar}.mkv"));
+            let mut encoder = VideoEncoder::new(
+                &path,
+                68,
+                32,
+                Rational(30, 1),
+                &EncoderConfig {
+                    encoder_name: Some("libx264".into()),
+                    container: Container::Matroska,
+                    quality_preset: Quality::High,
+                    preset: Some("ultrafast".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(encoder.yuv_frame.format(), Pixel::NV12);
+            for [y, u, v] in colors {
+                let y = vec![y; 68 * 32];
+                let u = vec![u; 34 * 16];
+                let v = vec![v; 34 * 16];
+                if planar {
+                    encoder.write_yuv420p_planes(&y, &u, &v).unwrap();
+                } else {
+                    let mut nv12 = y;
+                    nv12.extend(u.iter().zip(&v).flat_map(|(u, v)| [*u, *v]));
+                    encoder.write_nv12_frame(&nv12).unwrap();
+                }
+            }
+            encoder.finish().unwrap();
+            let mut input = format::input(&path).unwrap();
+            let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+            let index = stream.index();
+            let mut decoder = codec::context::Context::from_parameters(stream.parameters())
+                .unwrap()
+                .decoder()
+                .video()
+                .unwrap();
+            let mut decoded = Vec::new();
+            let mut drain = |decoder: &mut ffmpeg::decoder::Video| {
+                let mut frame = ffmpeg::frame::Video::empty();
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    decoded.push([frame.data(0)[0], frame.data(1)[0], frame.data(2)[0]]);
+                }
+            };
+            for (stream, packet) in input.packets() {
+                if stream.index() == index {
+                    decoder.send_packet(&packet).unwrap();
+                    drain(&mut decoder);
+                }
+            }
+            decoder.send_eof().unwrap();
+            drain(&mut decoder);
+            assert_eq!(decoded.len(), colors.len());
+            for (actual, expected) in decoded.iter().zip(colors) {
+                for channel in 0..3 {
+                    assert!(
+                        actual[channel].abs_diff(expected[channel]) <= 4,
+                        "{actual:?} != {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgba_fallback_uses_bt709_limited_conversion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut encoder = VideoEncoder::new(
+            &temporary.path().join("red.mkv"),
+            64,
+            64,
+            Rational(30, 1),
+            &EncoderConfig {
+                encoder_name: Some("libx264".into()),
+                container: Container::Matroska,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        encoder
+            .write_frame(&[255, 0, 0, 255].repeat(64 * 64))
+            .unwrap();
+        // BT.709 limited red is Y=63, Cb=102, Cr=240 (within rounding).
+        assert_eq!(encoder.yuv_frame.format(), Pixel::NV12);
+        assert!(encoder.yuv_frame.data(0)[0].abs_diff(63) <= 1);
+        assert!(encoder.yuv_frame.data(1)[0].abs_diff(102) <= 1);
+        assert!(encoder.yuv_frame.data(1)[1].abs_diff(240) <= 1);
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn live_timing_preserves_a_capture_stall_but_file_encoding_does_not() {
+        let temporary = tempfile::tempdir().unwrap();
+        for realtime in [false, true] {
+            let mut encoder = VideoEncoder::new(
+                &temporary.path().join(format!("timing-{realtime}.mkv")),
+                64,
+                64,
+                Rational(30, 1),
+                &EncoderConfig {
+                    encoder_name: Some("libx264".into()),
+                    container: Container::Matroska,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if realtime {
+                encoder.use_realtime_timestamps();
+            }
+            let pixels = vec![0; 64 * 64 * 4];
+            encoder.write_frame(&pixels).unwrap();
+            encoder.first_frame_time =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+            encoder.write_frame(&pixels).unwrap();
+            assert_eq!(encoder.frame_count, 2);
+            if realtime {
+                assert!(encoder.last_pts >= 60);
+            } else {
+                assert_eq!(encoder.last_pts, 1);
+            }
+            encoder.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn silent_audio_encodes_zeroed_samples() {
+        fn assert_silent(frame: &ffmpeg::frame::Audio) {
+            assert_eq!(frame.planes(), 2);
+            for plane in 0..2 {
+                let samples = frame.plane::<f32>(plane);
+                assert_eq!(samples.len(), frame.samples());
+                assert!(samples.iter().all(|sample| *sample == 0.0));
+            }
+        }
+
+        crate::init();
+        let temporary = tempfile::tempdir().unwrap();
+        let mut output = format::output(&temporary.path().join("silence.flv")).unwrap();
+        let mut audio = SilentAudio::new(&mut output).unwrap();
+        assert_silent(&audio.frame);
+        output.write_header().unwrap();
+        audio.output_time_base = output.stream(audio.stream_index).unwrap().time_base();
+
+        for reuse in 1..=4 {
+            SilentAudio::clear_frame(&mut audio.frame).unwrap();
+            audio.frame.plane_mut::<f32>(0).fill(f32::NAN);
+            audio.frame.plane_mut::<f32>(1).fill(f32::INFINITY);
+            let retained = unsafe {
+                let reference = ffmpeg::sys::av_frame_clone(audio.frame.as_ptr());
+                assert!(!reference.is_null());
+                ffmpeg::frame::Audio::wrap(reference)
+            };
+            audio
+                .write_up_to(
+                    &mut output,
+                    reuse * audio.samples_per_frame as i64,
+                    Rational(1, audio.sample_rate as i32),
+                )
+                .unwrap();
+            assert_silent(&audio.frame);
+            assert!(
+                retained
+                    .plane::<f32>(0)
+                    .iter()
+                    .all(|sample| sample.is_nan())
+            );
+            assert!(
+                retained
+                    .plane::<f32>(1)
+                    .iter()
+                    .all(|sample| sample.is_infinite())
+            );
+        }
+        audio
+            .write_up_to(&mut output, 1000, Rational(1, 1000))
+            .unwrap();
+        assert_silent(&audio.frame);
+        assert!(audio.next_pts >= 44_100);
+        output.write_trailer().unwrap();
+    }
 
     /// Only a positive, finite start time should shift audio; anything else
     /// (default exports, garbage values) must leave the soundtrack untouched.

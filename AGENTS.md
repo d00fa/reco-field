@@ -2,6 +2,21 @@
 
 Open-source GPU-accelerated panoramic sports camera software.
 
+## Reco Field appliance releases
+
+This fork ships the Jetson appliance as a versioned ARM64 Debian package. Every
+shipped change to appliance behavior, native pipeline or deployment must update
+`appliance/VERSION`, Python version metadata and `docs/RECO-FIELD-CHANGELOG.md`,
+then rebuild the `.deb`, corresponding source archive, manifest and checksums.
+Run the package release checks before publishing; never reuse a released version
+for different contents. Keep hardware-tested claims separate from unverified work.
+
+Never include recordings, private QA images, SSH/Wi-Fi/stream credentials,
+NetworkManager profiles, device SSD UUIDs or measured per-unit calibration in a
+package or Git commit. Installation and upgrade must preserve unit data, require
+its configured SSD, and leave other applications and the shared camera service
+alone. See `appliance/README.md` and `docs/RECO-FIELD.md` for the release contract.
+
 ## Project status
 
 Active release work lives in GitHub issues, PRs, and milestones, not in this

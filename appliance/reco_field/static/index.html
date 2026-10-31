@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#F5F5F7">
+  <title>Reco Field</title>
+  <link rel="stylesheet" href="/assets/app.css?v=0.1.0-r16">
+</head>
+<body>
+  <svg class="icon-sprite" aria-hidden="true">
+    <symbol id="i-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"></rect></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M14.5 5 13 3h-2L9.5 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+    <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"></path></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.86 2.86-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.5v-.1A1.7 1.7 0 0 0 8.4 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.86-2.86.06-.06A1.7 1.7 0 0 0 4 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H2.2V9.5h.1A1.7 1.7 0 0 0 4 8.4a1.7 1.7 0 0 0-.34-1.88l-.06-.06L6.46 3.6l.06.06A1.7 1.7 0 0 0 8.4 4a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1v-.1h4.1v.1A1.7 1.7 0 0 0 15 4a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.86 2.86-.06.06A1.7 1.7 0 0 0 19.4 8.4a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.1.4h.1v4.1h-.1a1.7 1.7 0 0 0-1.7 1.1Z"></path></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 20h.01M2 9a15 15 0 0 1 20 0"></path></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"></path></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="m21 15-5-5L5 20"></path></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4Z"></path><path d="M12 9v5M12 17h.01"></path></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"></path></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"></path></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"></path></symbol>
+  </svg>
+
+
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="app-view" class="app-shell">
+    <header class="topbar">
+      <a class="brand-lockup" href="#live" aria-label="Reco Field home"><svg aria-hidden="true"><use href="#i-camera"></use></svg><span>Reco Field</span></a>
+      <nav class="main-nav" aria-label="Main navigation">
+        <a href="#live" data-view="live" aria-current="page"><svg aria-hidden="true"><use href="#i-camera"></use></svg><span>Live</span></a>
+        <a href="#recordings" data-view="recordings"><svg aria-hidden="true"><use href="#i-folder"></use></svg><span>Recordings</span></a>
+        <a href="#setup/cameras" data-view="setup"><svg aria-hidden="true"><use href="#i-settings"></use></svg><span>Setup</span></a>
+      </nav>
+      <div class="status-strip" aria-label="Device connection">
+        <span id="record-chip" class="status-chip" hidden><span class="dot"></span><span>Idle</span></span>
+        <span id="preview-chip" class="status-chip" hidden><span class="dot"></span><span>Preview</span></span>
+        <span id="connection-chip" class="status-chip"><span class="dot"></span><span>Connecting</span></span>
+      </div>
+    </header>
+    <div id="global-notice" class="global-notice" role="status" hidden></div>
+    <main id="main-content" class="workspace" tabindex="-1">
+      <section id="view-live" class="main-view" aria-labelledby="preview-heading">
+        <div class="page-heading">
+          <div><h1 id="preview-heading">Viewfinder</h1><p id="capture-summary" class="muted">Waiting for camera settings</p></div>
+          <div class="view-state"><span id="capture-state" class="subtle-label" hidden></span><span id="simulator-badge" class="badge warning" hidden>Simulator</span><span id="preview-mode" class="subtle-label">Panorama</span></div>
+        </div>
+        <div class="live-layout">
+          <div class="capture-column">
+            <section class="preview-panel" aria-label="Camera view and recording">
+              <div id="preview-frame" class="preview-frame">
+                <video id="preview-video" playsinline muted autoplay aria-label="Live stitched panorama preview"></video>
+                <div id="preview-empty" class="preview-empty"><svg aria-hidden="true"><use href="#i-camera"></use></svg><strong id="preview-empty-title">Cameras idle</strong><span id="preview-detail">Record to open the stitched viewfinder</span></div>
+                <div id="preview-error" class="preview-error" role="alert" hidden></div>
+              </div>
+              <div class="record-controls">
+                <div class="record-action"><button id="preview-button" class="button quiet" type="button" hidden>Start preview</button><button id="record-button" class="record-button" type="button"><span class="record-symbol"><svg aria-hidden="true"><use href="#i-record"></use></svg></span><span>Record</span></button><time id="record-time" aria-label="Recording duration" hidden>00:00</time></div>
+                <label class="switch-row" for="start-stream"><span>Stream to destinations</span><input id="start-stream" class="switch" type="checkbox"></label>
+              </div>
+              <div id="record-mode-control" class="capture-options" hidden><label for="recording-mode">Save<select id="recording-mode"><option value="panorama">Panorama</option><option value="sources">Original cameras</option></select></label><p id="recording-mode-help" class="muted">Saves the stitched panorama.</p></div>
+              <div id="record-error" class="inline-error" role="alert" hidden></div>
+            </section>
+            <dl class="metrics-strip" aria-label="Current recording and device measurements">
+              <div><dt id="metric-fps-label">Frame rate</dt><dd id="metric-fps">—</dd></div>
+              <div><dt>Recorded</dt><dd id="metric-record-size">—</dd></div>
+              <div><dt>SSD free</dt><dd id="metric-storage">—</dd></div>
+              <div><dt>CPU temp</dt><dd id="metric-temperature">—</dd></div>
+              <div><dt>Memory</dt><dd id="metric-memory">—</dd></div>
+            </dl>
+            <div class="live-footer"><a id="readiness-summary" href="#setup/device">Checking device readiness</a><span id="metrics-note" class="muted">Measurements appear when available</span></div>
+          </div>
+          <aside class="live-inspector" aria-label="Streaming controls">
+        <section class="stream-panel" aria-labelledby="destinations-heading">
+          <div class="panel-heading">
+            <div>
+
+              <h2 id="destinations-heading">Streaming</h2>
+            </div>
+            <button id="add-destination" class="button quiet compact" type="button">
+              <svg aria-hidden="true"><use href="#i-plus"></use></svg>
+              Add
+            </button>
+          </div>
+          <label>Stream profile
+            <select id="stream-profile">
+              <option value="mobile">Mobile · 6 Mbps</option>
+              <option value="original">Original quality</option>
+            </select>
+          </label>
+          <p id="stream-profile-help" class="muted">6 Mbps per destination, plus audio and network overhead.</p>
+          <p id="stream-publisher-status" class="status-line" aria-live="polite">Mobile stream · idle</p>
+          <div id="destination-list" class="destination-list"></div>
+        </section>
+            <span id="live-chip" class="status-chip" hidden><span class="dot"></span><span>Stream off</span></span>
+          </aside>
+        </div>
+      </section>
+      <section id="view-recordings" class="main-view" aria-labelledby="recordings-heading" hidden>
+        <div class="page-heading"><div><h1 id="recordings-heading">Recordings</h1><p id="recordings-summary" class="muted">Your recordings on the SSD</p></div><button id="refresh-recordings" class="button quiet" type="button">Refresh</button></div>
+        <div id="sessions-error" class="inline-error" role="alert" hidden></div>
+        <section id="offline-job-panel" class="offline-job-panel" aria-labelledby="offline-job-heading" hidden>
+          <div class="section-heading"><h2 id="offline-job-heading">Create panorama</h2><button id="offline-job-cancel" class="button quiet" type="button" hidden>Cancel</button></div>
+          <p id="offline-job-progress" class="status-line" role="status"></p>
+          <div id="offline-job-error" class="inline-error" role="alert" hidden></div>
+          <a id="offline-job-download" class="button quiet" hidden>Download panorama</a>
+        </section>
+        <div id="sessions-list" class="session-list" hidden></div>
+        <div id="recordings-list" class="recording-list"></div>
+      </section>
+      <section id="view-setup" class="main-view" aria-labelledby="setup-heading" hidden>
+        <div class="page-heading"><div><h1 id="setup-heading">Setup</h1><p class="muted">Camera, alignment and device settings</p></div></div>
+        <div class="setup-layout">
+          <nav class="setup-nav" aria-label="Setup sections"><a href="#setup/cameras" data-setup="cameras" aria-current="page">Cameras</a><a href="#setup/alignment" data-setup="alignment">Alignment</a><a href="#setup/network" data-setup="network">Network</a><a href="#setup/device" data-setup="device">Device</a></nav>
+          <div class="setup-content">
+        <section id="setup-cameras" class="setup-panel" aria-labelledby="camera-heading">
+          <div class="section-heading">
+            <div><h2 id="camera-heading">Cameras</h2></div>
+            <span id="settings-lock" class="badge warning" hidden>Camera busy; edits locked</span>
+          </div>
+          <form id="camera-form" class="settings-form">
+            <fieldset>
+              <legend>Capture</legend>
+              <div class="form-grid">
+                <label>Left sensor<input id="left-device" inputmode="numeric" pattern="[0-9]+" required></label>
+                <label>Right sensor<input id="right-device" inputmode="numeric" pattern="[0-9]+" required></label>
+                <label>Sensor mode
+                  <select id="sensor-mode">
+                    <option value="0">Mode 0 | 4032x3040 | 30</option>
+                    <option value="1">Mode 1 | 3840x2160 | 30</option>
+                    <option value="2">Mode 2 | 1920x1080 | 60</option>
+                  </select>
+                </label>
+                <label>Capture width<input id="capture-width" type="number" min="320" max="8192" step="2" required></label>
+                <label>Capture height<input id="capture-height" type="number" min="180" max="8192" step="2" required></label>
+                <label>Capture fps<input id="capture-fps" type="number" min="1" max="60" required></label>
+                <label>View<select id="projection"><option value="panorama">Panorama</option><option value="perspective">Camera crop</option></select></label>
+                <label>Output width<input id="output-width" type="number" min="320" max="4096" step="4" required></label>
+                <label>Output height<input id="output-height" type="number" min="180" max="2160" step="2" required></label>
+                <label>Encoder<input id="encoder" value="libx264" readonly></label>
+                <label>Preset
+                  <select id="preset">
+                    <option value="ultrafast">ultrafast</option>
+                    <option value="superfast">superfast</option>
+                    <option value="veryfast">veryfast</option>
+                    <option value="faster">faster</option>
+                    <option value="fast">fast</option>
+                    <option value="medium">medium</option>
+                  </select>
+                </label>
+                <label>Quality
+                  <select id="quality">
+                    <option value="fast">fast</option>
+                    <option value="balanced">balanced</option>
+                    <option value="high">high</option>
+                  </select>
+                </label>
+                <label>Seam blend<input id="blend" type="number" min="0" max="1" step="0.01"></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>NVIDIA ISP</legend>
+              <div class="form-grid">
+                <label>Exposure
+                  <select id="exposure-mode">
+                    <option value="auto">Auto AE</option>
+                    <option value="manual">Manual</option>
+                  </select>
+                </label>
+                <label>Exposure min (ns)<input id="exposure-min" type="number" min="1" max="1000000000" required></label>
+                <label>Exposure max (ns)<input id="exposure-max" type="number" min="1" max="1000000000" required></label>
+                <label>Analog gain min<input id="gain-min" type="number" min="0.1" max="64" step="0.01" required></label>
+                <label>Analog gain max<input id="gain-max" type="number" min="0.1" max="64" step="0.01" required></label>
+                <label>Digital gain min<input id="digital-gain-min" type="number" min="0.1" max="8" step="0.01" required></label>
+                <label>Digital gain max<input id="digital-gain-max" type="number" min="0.1" max="8" step="0.01" required></label>
+                <label>White balance
+                  <select id="awb-mode">
+                    <option value="auto">Auto AWB</option>
+                    <option value="off">Off</option>
+                    <option value="incandescent">Incandescent</option>
+                    <option value="fluorescent">Fluorescent</option>
+                    <option value="tungsten">Tungsten</option>
+                    <option value="daylight">Daylight</option>
+                    <option value="cloudy">Cloudy</option>
+                    <option value="twilight">Twilight</option>
+                    <option value="shade">Shade</option>
+                    <option value="warm-fluorescent">Warm fluorescent</option>
+                  </select>
+                </label>
+                <label class="check-label"><input id="awb-lock" type="checkbox"> Lock AWB at start</label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Automation</legend>
+              <div class="form-grid">
+                <label class="check-label"><input id="auto-stream" type="checkbox"> Stream selected destinations</label>
+                <label class="check-label"><input id="auto-record" type="checkbox"> Record when service starts</label>
+                <label>Calibration frames<input id="calibration-frames" type="number" min="1" max="16" required></label>
+              </div>
+            </fieldset>
+            <div id="camera-form-error" class="inline-error" role="alert" hidden></div>
+            <div class="form-actions">
+              <button id="save-settings" class="button primary" type="submit">
+                <svg aria-hidden="true"><use href="#i-check"></use></svg>
+                Save settings
+              </button>
+            </div>
+          </form>
+        </section>
+        <section id="setup-alignment" class="setup-panel" aria-labelledby="calibration-heading" hidden>
+          <div class="section-heading">
+            <div><h2 id="calibration-heading">Alignment</h2></div>
+            <span id="calibration-badge" class="badge">Not calibrated</span>
+          </div>
+          <p class="context-help">Align both views before calibration. Matching needs shared detail and visible overlap.</p>
+          <div class="snapshot-grid">
+            <figure class="snapshot">
+              <div class="snapshot-frame"><img id="snapshot-left" alt="Current left camera setup view" hidden><div id="snapshot-left-empty" class="image-empty"><svg aria-hidden="true"><use href="#i-image"></use></svg><span>Left setup view</span></div></div>
+              <figcaption>Left sensor</figcaption>
+            </figure>
+            <figure class="snapshot">
+              <div class="snapshot-frame"><img id="snapshot-right" alt="Current right camera setup view" hidden><div id="snapshot-right-empty" class="image-empty"><svg aria-hidden="true"><use href="#i-image"></use></svg><span>Right setup view</span></div></div>
+              <figcaption>Right sensor</figcaption>
+            </figure>
+          </div>
+          <div class="button-row">
+            <button id="snapshot-button" class="button primary" type="button">
+              <svg aria-hidden="true"><use href="#i-camera"></use></svg>
+              Capture setup views
+            </button>
+            <button id="snapshot-cancel" class="button quiet" type="button" hidden>Cancel capture</button>
+          </div>
+          <div id="snapshot-status" class="status-line" aria-live="polite">No setup views captured</div>
+          <div id="snapshot-error" class="inline-error" role="alert" hidden></div>
+
+          <div class="divider"></div>
+          <div class="calibration-actions">
+            <div>
+              <h3>Geometric calibration</h3>
+              <p id="calibration-progress" class="muted">Import a valid calibration or run stereo matching.</p>
+            </div>
+            <div class="button-row">
+              <button id="calibrate-button" class="button primary" type="button">
+                <svg aria-hidden="true"><use href="#i-target"></use></svg>
+                Start calibration
+              </button>
+              <button id="calibrate-cancel" class="button quiet" type="button" hidden>Cancel</button>
+            </div>
+          </div>
+          <div id="calibration-error" class="inline-error" role="alert" hidden></div>
+          <details id="lens-details" class="lens-calibration">
+            <summary>Measure each lens</summary>
+            <p class="context-help">Print the board on A4 landscape at 100% and check its 30 mm squares with a ruler. Keep it flat and keep lens focus fixed. Capture 16–32 views per lens, covering all edges with different distances and tilts.</p>
+            <div class="button-row">
+              <a class="button quiet" href="/api/lenses/board.svg" download="reco-charuco-30mm.svg">Print board · 230 × 170 mm</a>
+              <label>Lens<select id="lens-side"><option value="left">Left sensor</option><option value="right">Right sensor</option></select></label>
+            </div>
+            <figure class="snapshot">
+              <div class="snapshot-frame"><img id="lens-preview" alt="Latest full-resolution lens calibration view" hidden><div id="lens-preview-empty" class="image-empty">Capture a view of the printed board</div></div>
+            </figure>
+            <p id="lens-count" class="status-line">0 of 16 views</p>
+            <div class="button-row">
+              <button id="lens-capture" class="button primary" type="button">Capture view</button>
+              <button id="lens-solve" class="button quiet" type="button">Solve lens</button>
+              <button id="lens-apply" class="button quiet" type="button">Apply profile</button>
+              <button id="lens-reset" class="button quiet" type="button">Reset views</button>
+              <button id="lens-cancel" class="button quiet" type="button" hidden>Cancel</button>
+            </div>
+            <p id="lens-progress" class="status-line" aria-live="polite">A successful lens fit is checked against held-out views before it can be applied.</p>
+            <p id="lens-quality" class="muted" hidden></p>
+            <div id="lens-error" class="inline-error" role="alert" tabindex="-1" hidden></div>
+          </details>
+          <details class="profile-import"><summary>Import profiles</summary><div class="import-grid">
+            <label class="file-control">Import calibration JSON<input id="calibration-file" type="file" accept="application/json,.json"></label>
+            <label class="file-control">Import left lens profile<input id="lens-file" type="file" accept="application/json,.json"></label>
+            <label class="file-control">Import right lens profile<input id="right-lens-file" type="file" accept="application/json,.json"></label>
+          </div></details>
+        </section>
+            <section id="setup-network" class="setup-panel" aria-label="Network settings" hidden>
+          <section id="wifi-setup-details" aria-labelledby="wifi-setup-heading" hidden>
+            <div class="section-heading">
+              <div><h3 id="wifi-setup-heading">Camera Wi-Fi</h3><p id="wifi-setup-availability" class="muted"></p></div>
+              <button id="wifi-setup-edit" class="button quiet" type="button" aria-expanded="false" aria-controls="wifi-setup-form">Edit Wi-Fi</button>
+            </div>
+            <div class="wifi-share">
+              <figure class="wifi-qr">
+                <img id="wifi-setup-qr" width="240" height="240" alt="Scan to join this camera’s Wi-Fi">
+                <figcaption>Scan with another phone’s camera, then tap <strong>Join</strong>.</figcaption>
+                <p id="wifi-qr-error" class="inline-error" role="alert" hidden></p>
+                <a id="wifi-setup-download" class="button quiet" href="/api/network/setup/qr.png" download="reco-field-wifi.png">Save QR code</a>
+              </figure>
+              <div class="wifi-credentials">
+                <div class="wifi-credential">
+                  <div><span class="subtle-label">Network name</span><p id="wifi-setup-ssid" class="wifi-value"></p></div>
+                  <button id="wifi-copy-ssid" class="button quiet" type="button" aria-label="Copy camera Wi-Fi network name">Copy</button>
+                </div>
+                <div class="wifi-credential">
+                  <div><span class="subtle-label">Password</span><p id="wifi-setup-password" class="wifi-value"></p></div>
+                  <div class="button-row">
+                    <button id="wifi-show-password" class="button quiet" type="button" aria-pressed="false">Show</button>
+                    <button id="wifi-copy-password" class="button quiet" type="button" aria-label="Copy camera Wi-Fi password">Copy</button>
+                  </div>
+                </div>
+                <a class="button primary wifi-open" href="http://10.42.0.1:8081">Open camera</a>
+                <p class="muted wifi-open-help">Use after joining Camera Wi-Fi.</p>
+              </div>
+            </div>
+            <form id="wifi-setup-form" class="settings-form wifi-edit-form" hidden>
+              <div class="form-grid">
+                <label>Camera network name<input id="wifi-setup-name-input" maxlength="32" autocomplete="off" required></label>
+                <label>New password<input id="wifi-setup-password-input" type="password" minlength="8" maxlength="63" autocomplete="new-password" aria-describedby="wifi-setup-password-help"></label>
+              </div>
+              <p id="wifi-setup-password-help" class="muted">8–63 characters. Leave blank to keep your current password.</p>
+              <p id="wifi-setup-reconnect" class="status-line" hidden>Saving disconnects phones on Camera Wi-Fi. Rejoin using the new details.</p>
+              <div id="wifi-setup-error" class="inline-error" role="alert" hidden></div>
+              <div class="form-actions">
+                <button id="wifi-setup-cancel" class="button quiet" type="button">Cancel</button>
+                <button id="wifi-setup-save" class="button primary" type="submit">Save Wi-Fi</button>
+              </div>
+            </form>
+            <p id="wifi-setup-message" class="status-line" role="status" tabindex="-1"></p>
+            <div class="divider"></div>
+          </section>
+          <div class="section-heading">
+            <div><h3>Internet connection</h3><p id="network-state" class="muted" aria-live="polite">Checking connection…</p></div>
+            <button id="wifi-scan" class="button quiet compact" type="button">Find networks</button>
+          </div>
+          <form id="wifi-form" class="settings-form">
+            <div class="form-grid">
+              <label>Wi-Fi / hotspot name<input id="wifi-ssid" list="wifi-networks" maxlength="32" autocomplete="off" required><datalist id="wifi-networks"></datalist></label>
+              <label>Hotspot password<input id="wifi-password" type="password" minlength="8" maxlength="64" autocomplete="new-password" required></label>
+            </div>
+            <p class="muted">Turn on your phone hotspot to give the camera internet access. After connecting, reopen <a href="http://reco-jetson.local:8081">Reco Field</a>.</p>
+            <div class="form-actions"><button id="wifi-connect" class="button primary" type="submit">Save &amp; connect</button></div>
+            <div id="wifi-message" class="status-line" role="status"></div>
+          </form>
+
+            </section>
+            <section id="setup-device" class="setup-panel" aria-label="Device information and storage" hidden>
+              <div class="section-heading"><h2>Device</h2><span id="device-sample-state" class="subtle-label">Measurements unavailable</span></div>
+              <dl class="system-facts"><div><dt>Model</dt><dd id="device-model">—</dd></div><div><dt>Uptime</dt><dd id="device-uptime">—</dd></div><div><dt>CPU</dt><dd id="device-cpu">—</dd></div><div><dt>Memory</dt><dd id="device-memory">—</dd></div><div><dt>SSD</dt><dd id="device-storage">—</dd></div><div><dt>Software</dt><dd id="device-software">Reco Field 0.1.0</dd></div></dl>
+              <div class="divider"></div><h3>Storage reserve</h3>
+          <form id="service-form" class="settings-form">
+            <div class="form-grid">
+              <label>Minimum free disk (GiB)<input id="min-free-gb" type="number" min="1" max="1000" step="0.5" required></label>
+            </div>
+            <div class="form-actions">
+              <button id="save-service-settings" class="button primary" type="submit">Save service settings</button>
+            </div>
+          </form>
+              <div class="divider"></div>
+        <section class="readiness-section" aria-labelledby="readiness-heading">
+          <div class="panel-heading">
+            <div>
+
+              <h2 id="readiness-heading">Readiness</h2>
+            </div>
+            <button id="refresh-preflight" class="icon-button small" type="button" aria-label="Refresh system readiness" title="Refresh readiness">
+              <svg aria-hidden="true"><use href="#i-wifi"></use></svg>
+            </button>
+          </div>
+          <div id="preflight-list" class="check-list" aria-live="polite"></div>
+        </section>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <dialog id="destination-dialog" aria-labelledby="destination-dialog-title">
+    <form id="destination-form" method="dialog">
+      <div class="panel-heading">
+        <div><p class="eyebrow">Output</p><h2 id="destination-dialog-title">Add destination</h2></div>
+        <button class="icon-button" type="button" data-close-dialog aria-label="Close destination dialog">&times;</button>
+      </div>
+      <input id="destination-id" type="hidden">
+      <div class="form-stack">
+        <label>Name<input id="destination-name" maxlength="64" required></label>
+        <label>Platform
+          <select id="destination-provider">
+            <option value="youtube">YouTube</option>
+            <option value="facebook">Facebook</option>
+            <option value="twitch">Twitch</option>
+            <option value="custom">Custom RTMP / SRT</option>
+          </select>
+        </label>
+        <label>Ingest URL<input id="destination-url" type="password" autocomplete="off" maxlength="4096" placeholder="rtmp://host/app/key"></label>
+        <p id="destination-url-help" class="muted">The stream key is stored privately and never returned to the browser.</p>
+        <label class="check-label"><input id="destination-enabled" type="checkbox" checked> Enabled</label>
+        <div id="destination-error" class="inline-error" role="alert" hidden></div>
+      </div>
+      <div class="form-actions">
+        <button class="button quiet" type="button" data-close-dialog>Cancel</button>
+        <button class="button primary" type="submit">Save destination</button>
+      </div>
+    </form>
+  </dialog>
+
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/assets/hls.min.js?v=0.1.0-r8"></script>
+  <script src="/assets/app.js?v=0.1.0-r16"></script>
+</body>
+</html>

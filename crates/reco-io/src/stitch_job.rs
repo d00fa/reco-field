@@ -44,6 +44,8 @@ pub struct StitchJob {
     format: Format,
     audio: AudioMode,
     resolution: Option<(u32, u32)>,
+    projection: reco_core::render::viewport::OutputProjection,
+    source_manifest: Option<PathBuf>,
     encoder_name: Option<String>,
     quality_value: Option<u8>,
     preset: Option<String>,
@@ -176,6 +178,8 @@ pub struct StitchResult {
     pub encoder_name: String,
     pub decode_mode: String,
     pub telemetry: Option<reco_core::telemetry::TelemetrySnapshot>,
+    /// Duplicate/skip counts for timestamp-aligned source-camera exports.
+    pub source_sync: Option<crate::source_bundle::SourceSyncStats>,
 }
 
 impl StitchResult {
@@ -248,6 +252,8 @@ impl StitchJob {
             format: Format::default(),
             audio: AudioMode::default(),
             resolution: None,
+            projection: reco_core::render::viewport::OutputProjection::Perspective,
+            source_manifest: None,
             encoder_name: None,
             quality_value: None,
             preset: None,
@@ -280,6 +286,21 @@ impl StitchJob {
     }
 
     // ── Output settings ──
+
+    /// Select a fixed panorama or the legacy perspective viewport.
+    pub fn projection(mut self, projection: reco_core::render::viewport::OutputProjection) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Use the immutable capture bundle's timestamps and saved calibration.
+    ///
+    /// Requires single-file inputs and file-backed calibration from that bundle.
+    /// Existing output files are refused, and cancellation returns an error.
+    pub fn source_manifest(mut self, path: impl AsRef<Path>) -> Self {
+        self.source_manifest = Some(path.as_ref().to_path_buf());
+        self
+    }
 
     /// Set the output video codec.
     pub fn codec(mut self, codec: Codec) -> Self {
@@ -554,12 +575,47 @@ impl StitchJob {
         let start = std::time::Instant::now();
 
         // Load calibration
-        let cal = match self.calibration {
+        let calibration_path = match &self.calibration {
+            CalibrationSource::File(path) => Some(path.clone()),
+            CalibrationSource::Memory(_) => None,
+        };
+        let mut cal = match self.calibration {
             CalibrationSource::File(ref path) => {
                 reco_core::calibration::MatchCalibration::from_file(path)
                     .map_err(|e| StitchError::Calibration(format!("{e}")))?
             }
             CalibrationSource::Memory(cal) => *cal,
+        };
+        let bundle = if let Some(path) = &self.source_manifest {
+            #[cfg(feature = "stacked-output")]
+            if self.replay_recording.is_some() {
+                return Err(StitchError::Other(
+                    "source-bundle export already retains its source files; stacked replay recording is unsupported".into(),
+                ));
+            }
+            if self.output.exists()
+                || self.sync_offset.is_some_and(|value| value != 0)
+                || !matches!(self.left, InputPath::Single(_))
+                || !matches!(self.right, InputPath::Single(_))
+            {
+                return Err(StitchError::Other("source-bundle export requires a new output, single camera files, and no manual sync offset".into()));
+            }
+            let calibration_path = calibration_path.as_deref().ok_or_else(|| {
+                StitchError::Other(
+                    "source-bundle export requires its saved calibration file".into(),
+                )
+            })?;
+            let bundle = crate::source_bundle::SourceBundle::load(
+                path,
+                self.left.first_path(),
+                self.right.first_path(),
+                calibration_path,
+            )?;
+            bundle.scale_calibration(&mut cal)?;
+            self.audio = AudioMode::Disabled;
+            Some(bundle)
+        } else {
+            None
         };
         let effective_sync = self.sync_offset.unwrap_or(cal.sync_offset);
         if self.sync_offset.is_none() && cal.sync_offset != 0 {
@@ -571,7 +627,9 @@ impl StitchJob {
         let gpu_name = gpu.gpu_name().to_string();
 
         log::debug!("StitchJob::run: force_cpu_decode={}", self.force_cpu_decode);
-        let mut source = if self.force_cpu_decode {
+        let mut source = if let Some(bundle) = bundle {
+            crate::SmartFileSource::open_bundle(bundle)?
+        } else if self.force_cpu_decode {
             log::info!("Force CPU decode: zero-copy disabled by --no-zero-copy");
             crate::SmartFileSource::open_cpu_only(&self.left, &self.right, effective_sync)?
         } else {
@@ -593,6 +651,7 @@ impl StitchJob {
 
         // Build session
         let viewport = reco_core::render::viewport::ViewportConfig {
+            projection: self.projection,
             width: out_w,
             height: out_h,
             blend_width: self.blend_width,
@@ -611,6 +670,9 @@ impl StitchJob {
             right_rotation: source.right_rotation(),
         };
         let mut session = reco_core::session::StitchSession::with_gpu(gpu, session_config)?;
+        if let Some([left, right]) = source.bundle_colorimetry() {
+            session.pipeline_mut().set_input_colorimetry(left, right);
+        }
 
         session.telemetry_mut().set_gpu_name(gpu_name.clone());
         session.telemetry_mut().set_decode_mode(decode_mode.clone());
@@ -827,6 +889,7 @@ impl StitchJob {
         let replay_cfg: Option<()> = None;
 
         let frame_count;
+        let source_sync;
         // Tracks a CPU-path replay decorator when that arm is
         // chosen; the finalizer below calls `finish()` after the
         // run. GPU path finalizes via
@@ -907,6 +970,8 @@ impl StitchJob {
                     interrupted,
                     self.on_progress.take(),
                 )?;
+                source.validate_completion()?;
+                source_sync = source.source_sync_stats();
             } else {
                 if cfg.scale.is_some() {
                     log::warn!(
@@ -938,6 +1003,7 @@ impl StitchJob {
                     self.on_progress.take(),
                 )?;
                 replay_src = Some(replay);
+                source_sync = None;
             }
         } else {
             frame_count = session.run(
@@ -946,6 +1012,8 @@ impl StitchJob {
                 interrupted,
                 self.on_progress.take(),
             )?;
+            source.validate_completion()?;
+            source_sync = source.source_sync_stats();
         }
         #[cfg(not(feature = "stacked-output"))]
         {
@@ -958,6 +1026,8 @@ impl StitchJob {
                 interrupted,
                 self.on_progress.take(),
             )?;
+            source.validate_completion()?;
+            source_sync = source.source_sync_stats();
         }
 
         if let Some(cb) = self.on_finalizing.take() {
@@ -972,6 +1042,13 @@ impl StitchJob {
         session.clear_stacked_gpu_recorder();
         let telemetry_snap = session.telemetry_snapshot();
         session.finish()?;
+
+        if self.source_manifest.is_some() && interrupted.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StitchError::Other(
+                "source-bundle export cancelled; partial output retained".into(),
+            ));
+        }
 
         #[cfg(feature = "stacked-output")]
         if let Some(mut replay) = replay_src.take()
@@ -1003,6 +1080,11 @@ impl StitchJob {
                     }
                 }
                 Err(e) => {
+                    if self.source_manifest.is_some() {
+                        return Err(StitchError::Other(format!(
+                            "cannot verify completed source-bundle export: {e}"
+                        )));
+                    }
                     log::warn!(
                         "post-run probe of {} failed ({e}); cannot verify video stream, trusting encoder",
                         output_path.display()
@@ -1018,6 +1100,7 @@ impl StitchJob {
             encoder_name: enc_name,
             decode_mode,
             telemetry: Some(telemetry_snap),
+            source_sync,
         })
     }
 }
@@ -1025,6 +1108,18 @@ impl StitchJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panorama_projection_is_explicit_and_keeps_legacy_default() {
+        use reco_core::render::viewport::OutputProjection;
+        let job = StitchJob::new("left.mkv", "right.mkv", "calibration.json", "output.mkv");
+        assert_eq!(job.projection, OutputProjection::Perspective);
+        let job = job
+            .projection(OutputProjection::Panorama)
+            .source_manifest("manifest.json");
+        assert_eq!(job.projection, OutputProjection::Panorama);
+        assert_eq!(job.source_manifest.unwrap(), PathBuf::from("manifest.json"));
+    }
 
     #[test]
     fn all_paths_returns_every_chained_segment() {

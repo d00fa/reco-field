@@ -243,6 +243,74 @@ impl Panner for NanPanner {
 
 // ─── Tests ─────────────────────────────────────────────────────────────
 
+#[test]
+#[ignore] // requires GPU
+fn default_camera_pose_limits_fov_without_a_panner() {
+    let mut session = build_test_session(None, None, 1).expect("session build");
+    let maximum = session
+        .core()
+        .coverage()
+        .expect("coverage")
+        .max_fov_degrees();
+    session.pipeline_mut().set_fov(120.0);
+    let pose = session.director_position();
+    assert!(pose.fov_degrees.expect("resolved FOV") <= maximum);
+    assert!(session.core().pipeline().fov() <= maximum);
+    for _ in 0..10 {
+        let next = session.director_position();
+        assert_eq!(next.fov_degrees, pose.fov_degrees);
+        assert_eq!(next.yaw, pose.yaw);
+        assert_eq!(next.pitch, pose.pitch);
+    }
+}
+
+#[test]
+#[ignore] // requires GPU
+fn unconstrained_camera_pose_preserves_requested_view() {
+    let mut session = build_test_session(None, None, 1).expect("session build");
+    session.core_mut().set_constrained_look(false);
+    session.pipeline_mut().set_fov(100.0);
+    let pose = session.director_position();
+    assert_eq!(pose.fov_degrees, None);
+    assert_eq!(session.core().pipeline().fov(), 100.0);
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn fixed_panorama_bypasses_director_fov_and_pose_clamps() {
+    let mut session = StitchSession::builder()
+        .calibration(test_calibration())
+        .input_dimensions(W, H)
+        .viewport(ViewportConfig {
+            projection: crate::render::viewport::OutputProjection::Panorama,
+            width: 128,
+            height: 48,
+            ..Default::default()
+        })
+        .build()
+        .unwrap();
+    session.previous_panner_pose = ViewportPosition {
+        yaw: 0.6,
+        pitch: 0.3,
+        fov_degrees: Some(30.0),
+    };
+    let original_bounds = session.core().pipeline().panorama_bounds().unwrap();
+    let pose = session.director_position();
+    assert_eq!(pose.yaw, 0.0);
+    assert_eq!(pose.pitch, 0.0);
+    assert_eq!(pose.fov_degrees, None);
+    assert_eq!(session.core().pipeline().fov(), 75.0);
+    assert_eq!(
+        session
+            .core()
+            .pipeline()
+            .panorama_bounds()
+            .unwrap()
+            .yaw_span,
+        original_bounds.yaw_span
+    );
+}
+
 /// Build a session using the builder pattern with test defaults.
 /// Trackers and panners are attached post-build (they have their own
 /// setters and aren't part of the builder API).

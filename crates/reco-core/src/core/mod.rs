@@ -343,6 +343,11 @@ impl StitchCore {
     /// horizon correction is a render-site concern (see Model 3 in
     /// `PoseControl::render_pose`).
     pub fn safe_clamp(&self, pose: ViewportPosition) -> ViewportPosition {
+        if self.pipeline.viewport().projection
+            == crate::render::viewport::OutputProjection::Panorama
+        {
+            return ViewportPosition::default();
+        }
         let Some(coverage) = &self.coverage else {
             return pose;
         };

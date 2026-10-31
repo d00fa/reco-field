@@ -16,23 +16,32 @@ impl StitchSession {
     /// constraining in the session, so panners can output unconstrained
     /// positions.
     pub fn director_position(&mut self) -> ViewportPosition {
+        let panorama = self.core.pipeline().viewport().projection
+            == crate::render::viewport::OutputProjection::Panorama;
         // Source the raw pre-clamp pose from the panner's most recent
         // decision. When no panner is attached the previous pose stays
         // at its default (identity) value so the viewport centers.
-        let mut pos = self.previous_panner_pose;
+        let mut pos = if panorama {
+            ViewportPosition::default()
+        } else {
+            self.previous_panner_pose
+        };
 
         // The panner outputs world-space coordinates (from detections
         // mapped via camera_to_panorama). Clamp in world space, then
         // convert to the user-space pitch the renderer expects (the
         // view_matrix applies rig_tilt as a basis rotation, so the
         // render-site pitch must compensate via rig_correction).
-        if let Some(coverage) = self.core.coverage() {
-            if let Some(ref mut fov) = pos.fov_degrees {
-                *fov = fov.min(coverage.max_fov_degrees());
-            }
+        if let Some(coverage) = self
+            .core
+            .coverage()
+            .filter(|_| !panorama && self.core.constrained_look())
+        {
             let fov = pos
                 .fov_degrees
-                .unwrap_or_else(|| self.core.pipeline().fov());
+                .unwrap_or_else(|| self.core.pipeline().fov())
+                .min(coverage.max_fov_degrees());
+            pos.fov_degrees = Some(fov);
             let aspect = self.core.pipeline().viewport().aspect_ratio();
             let rig_tilt = self.core.pipeline().viewport().rig_tilt;
             // Clamp in world space (rig_tilt=0 so coverage stays in
@@ -55,6 +64,12 @@ impl StitchSession {
             );
             pos.yaw = ry;
             pos.pitch = rp;
+            pos.fov_degrees = Some(coverage.fit_render_fov(
+                pos,
+                self.core.pipeline().viewport(),
+                self.core.pipeline().calibration(),
+                &self.core.pipeline().scene,
+            ));
         }
 
         // Trace: PosePresented. This is the pose the renderer will
@@ -372,21 +387,32 @@ impl StitchSession {
         yaw: f32,
         pitch: f32,
     ) -> Result<(), SessionError> {
+        let frame_start = std::time::Instant::now();
         let render_buf = self
             .core
             .render_imported_textures_at_pose(left_y, left_uv, right_y, right_uv, yaw, pitch);
+        let render_submit = frame_start.elapsed();
         self.submit_render_output(render_buf)?;
 
         // Replay pack from the imported views (not internal plane textures,
         // since render_imported_textures doesn't copy into them).
-        let ly = left_y.create_view(&wgpu::TextureViewDescriptor::default());
-        let lu = left_uv.create_view(&wgpu::TextureViewDescriptor::default());
-        let ry = right_y.create_view(&wgpu::TextureViewDescriptor::default());
-        let ru = right_uv.create_view(&wgpu::TextureViewDescriptor::default());
-        self.core.pack_gpu_stacked_replay_from_views(
-            crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 { y: &ly, uv: &lu },
-            crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 { y: &ry, uv: &ru },
-        );
+        if self.core.stacked_atlas_dims().is_some() {
+            let ly = left_y.create_view(&wgpu::TextureViewDescriptor::default());
+            let lu = left_uv.create_view(&wgpu::TextureViewDescriptor::default());
+            let ry = right_y.create_view(&wgpu::TextureViewDescriptor::default());
+            let ru = right_uv.create_view(&wgpu::TextureViewDescriptor::default());
+            self.core.pack_gpu_stacked_replay_from_views(
+                crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 { y: &ly, uv: &lu },
+                crate::gpu::yuv_stack_packer::StackedPackSource::Nv12 { y: &ry, uv: &ru },
+            );
+        }
+        self.telemetry.record_frame(crate::telemetry::FrameTiming {
+            stitch: Some(render_submit),
+            readback: Some(self.last_readback_time),
+            submit: Some(self.last_submit_time),
+            total: Some(frame_start.elapsed()),
+            ..Default::default()
+        });
         Ok(())
     }
 

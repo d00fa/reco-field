@@ -1,0 +1,49 @@
+name: Reco Field package checks
+
+on:
+  push:
+    branches: [main]
+    paths: ['appliance/**', 'crates/**', 'resources/**', 'Cargo.*', 'docs/RECO-FIELD*', '.github/workflows/reco-field-package.yml']
+  pull_request:
+    paths: ['appliance/**', 'crates/**', 'resources/**', 'Cargo.*', 'docs/RECO-FIELD*', '.github/workflows/reco-field-package.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-contract:
+    runs-on: ubuntu-22.04
+    env:
+      PYTHONPATH: appliance
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Check release version and changelog
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != 0000000000000000000000000000000000000000 ]; then
+            python appliance/scripts/release_check.py --base "$BASE_SHA"
+          else
+            python appliance/scripts/release_check.py
+          fi
+      - name: Test package lifecycle and installer contracts
+        run: |
+          python -m pip install -r appliance/requirements-dev.txt
+          python -m pytest appliance/tests/test_debian.py appliance/tests/test_install.py -q
+          bash -n appliance/scripts/build-deb.sh appliance/scripts/package.sh
+          for script in appliance/packaging/debian/{preinst,postinst,prerm,postrm}; do sh -n "$script"; done
+      - name: Source release archive
+        run: bash appliance/scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reco-field-source
+          path: appliance/dist/*source.tar.gz*
+
+# Native release builds run explicitly on a trusted JetPack 6 host using
+# appliance/scripts/build-deb.sh. Public pull requests never run on the camera.

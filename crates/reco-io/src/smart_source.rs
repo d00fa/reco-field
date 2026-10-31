@@ -50,6 +50,7 @@ pub struct SmartFileSource {
 
 enum SourceMode {
     Cpu(crate::adapters::FfmpegFileSource),
+    Bundle(Box<crate::source_bundle::BundleSource>),
     #[cfg(target_os = "linux")]
     GpuZeroCopy(Box<LinuxZeroCopyState>),
     #[cfg(target_os = "macos")]
@@ -130,6 +131,48 @@ struct LinuxZeroCopyState {
 }
 
 impl SmartFileSource {
+    /// Replay a finalized camera bundle on its common capture-time timeline.
+    pub fn open_bundle(bundle: crate::source_bundle::SourceBundle) -> Result<Self, SourceError> {
+        let source = crate::source_bundle::BundleSource::open(bundle)?;
+        let info = source.info();
+        Ok(Self {
+            mode: SourceMode::Bundle(Box::new(source)),
+            info,
+            pixel_format: GpuPixelFormat::Nv12,
+            full_range: false,
+            left_rotation: 0,
+            right_rotation: 0,
+            decode_mode: "Timestamp-aligned CPU upload",
+            exhausted: false,
+        })
+    }
+
+    /// Validate source packet counts and end timestamps after a complete export.
+    pub fn validate_completion(&mut self) -> Result<(), SourceError> {
+        if let SourceMode::Bundle(source) = &mut self.mode {
+            source.validate_completion()?;
+        }
+        Ok(())
+    }
+
+    /// Timing resampling counts, when replaying a captured source bundle.
+    pub fn source_sync_stats(&self) -> Option<crate::source_bundle::SourceSyncStats> {
+        if let SourceMode::Bundle(source) = &self.mode {
+            Some(source.stats())
+        } else {
+            None
+        }
+    }
+
+    /// Explicit per-camera colorimetry for a validated source bundle.
+    pub fn bundle_colorimetry(&self) -> Option<[reco_core::render::renderer::InputColorimetry; 2]> {
+        if let SourceMode::Bundle(source) = &self.mode {
+            Some(source.colors)
+        } else {
+            None
+        }
+    }
+
     /// Open a stereo file source with automatic backend selection.
     ///
     /// Probes the left video for metadata (resolution, codec, rotation,
@@ -608,6 +651,7 @@ impl FrameSource for SmartFileSource {
 
     fn next_frame(&mut self) -> Result<Option<StereoFrame>, SourceError> {
         match &mut self.mode {
+            SourceMode::Bundle(source) => source.next_frame(),
             SourceMode::Cpu(source) => {
                 let frame = source.next_frame()?;
                 if frame.is_none() {
@@ -676,11 +720,12 @@ impl FrameSource for SmartFileSource {
     }
 
     fn is_gpu_resident(&self) -> bool {
-        !matches!(self.mode, SourceMode::Cpu(_))
+        !matches!(self.mode, SourceMode::Cpu(_) | SourceMode::Bundle(_))
     }
 
     fn skip_frames(&mut self, count: u64) -> Result<u64, SourceError> {
         match &mut self.mode {
+            SourceMode::Bundle(source) => source.skip_frames(count),
             #[cfg(target_os = "linux")]
             SourceMode::GpuZeroCopy(state) => {
                 let rx = state
@@ -751,6 +796,7 @@ impl FrameSource for SmartFileSource {
         // is also set by `try_next_frame` (the zero-copy modes don't
         // implement `try_next_frame`, so their local flag is sufficient).
         match &self.mode {
+            SourceMode::Bundle(source) => source.is_exhausted(),
             SourceMode::Cpu(source) => self.exhausted || source.is_exhausted(),
             #[cfg(target_os = "linux")]
             SourceMode::GpuZeroCopy(_) => self.exhausted,
@@ -766,6 +812,10 @@ impl FrameSource for SmartFileSource {
         if let SourceMode::D3d11ZeroCopy(state) = &mut self.mode {
             state.ensure_running();
         }
+    }
+
+    fn total_frames(&self) -> Option<u64> {
+        self.info.total_frames
     }
 }
 

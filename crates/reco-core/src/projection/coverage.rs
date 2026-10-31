@@ -2,7 +2,9 @@
 
 use crate::calibration::MatchCalibration;
 use crate::detect::detector::CameraId;
+use crate::detect::director::ViewportPosition;
 use crate::render::scene::SceneGeometry;
+use crate::render::viewport::ViewportConfig;
 
 use super::camera_to_panorama;
 
@@ -102,6 +104,74 @@ impl PanoramaExtent {
 /// Angular offsets of viewport boundary points from center.
 ///
 impl CoverageBoundary {
+    /// Fit the rendered frustum to actual source coverage after the coarse pose clamp.
+    pub(crate) fn fit_render_fov(
+        &self,
+        pose: ViewportPosition,
+        viewport: &ViewportConfig,
+        calibration: &MatchCalibration,
+        scene: &SceneGeometry,
+    ) -> f32 {
+        let requested = pose
+            .fov_degrees
+            .unwrap_or(viewport.fov_degrees)
+            .clamp(1.0, 179.0);
+        let view = crate::render::renderer::view_matrix(
+            &self.camera_position,
+            pose.yaw,
+            pose.pitch,
+            viewport.rig_tilt,
+            viewport.rig_roll,
+        );
+        let Some(inverse_view) = view.try_inverse() else {
+            return requested;
+        };
+        let camera = super::VirtualCamera::new(&self.camera_position);
+        let covered = |x: f32, y: f32, tangent: f32| {
+            let ray = inverse_view
+                .transform_vector(&nalgebra::Vector3::new(
+                    x * tangent * viewport.aspect_ratio(),
+                    y * tangent,
+                    -1.0,
+                ))
+                .normalize();
+            let point = camera.direction_to_yaw_pitch(&ray);
+            [CameraId::Left, CameraId::Right].into_iter().any(|side| {
+                super::panorama_to_camera(point.yaw, point.pitch, side, calibration, scene)
+                    .is_some()
+            })
+        };
+        let fits = |fov: f32| {
+            let tangent = (fov.to_radians() * 0.5).tan();
+            (0..=32).all(|i| {
+                let p = i as f32 / 16.0 - 1.0;
+                covered(p, -1.0, tangent)
+                    && covered(p, 1.0, tangent)
+                    && covered(-1.0, p, tangent)
+                    && covered(1.0, p, tangent)
+                    && covered(0.0, p, tangent)
+            })
+        };
+        if fits(requested) {
+            return requested;
+        }
+        // A missing center cannot be recovered by zooming; keep its direction.
+        if !fits(1.0) {
+            return requested;
+        }
+        let (mut low, mut high) = (1.0, requested);
+        for _ in 0..10 {
+            let middle = (low + high) * 0.5;
+            if fits(middle) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        // Leave a small margin between probes for the curved lens/quad boundary.
+        (low - 0.5).max(1.0)
+    }
+
     /// Build the coverage boundary from calibration data.
     ///
     /// Densely samples both planes' edge loops and a sparse interior grid,
@@ -458,5 +528,178 @@ impl CoverageBoundary {
             min_pitch_range: self.min_pitch_range,
             camera_position: self.camera_position,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibration::{CameraParams, PlaneLayout};
+
+    fn garage_calibration() -> MatchCalibration {
+        let lens = CameraParams {
+            width: 4032,
+            height: 3040,
+            fx: 2092.640480434009,
+            fy: 2083.712938662459,
+            cx: 2055.922945560364,
+            cy: 1479.3015421724676,
+            d: [
+                -0.0008852475107180186,
+                0.04858733977083213,
+                -0.060099529576326534,
+                0.02735409281151152,
+            ],
+        };
+        MatchCalibration {
+            left: lens.clone(),
+            right: lens,
+            layout: PlaneLayout {
+                camera_axis_offset: 0.24960595819567188,
+                intersect: 0.46521607427309203,
+                x_ty: -0.043550260140647765,
+                x_rz: 0.004191979829482283,
+                z_rx: -0.12882016960454748,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            },
+            rig_tilt: 0.0,
+            rig_roll: 0.0,
+            sync_offset: 0,
+            field_roi: None,
+            lens_correction_amount: 1.0,
+            blend_width: 0.15,
+        }
+    }
+
+    fn uncovered_samples(
+        calibration: &MatchCalibration,
+        scene: &SceneGeometry,
+        viewport: &ViewportConfig,
+        pose: ViewportPosition,
+        fov: f32,
+    ) -> usize {
+        let projection =
+            nalgebra::Perspective3::new(viewport.aspect_ratio(), fov.to_radians(), 0.01, 100.0);
+        let view = crate::render::renderer::view_matrix(
+            &scene.camera_position,
+            pose.yaw,
+            pose.pitch,
+            viewport.rig_tilt,
+            viewport.rig_roll,
+        );
+        let inverse = (projection.to_homogeneous() * view).try_inverse().unwrap();
+        let camera = super::super::VirtualCamera::new(&scene.camera_position);
+        let covered = |x, y| {
+            let world = inverse.transform_point(&nalgebra::Point3::new(x, y, 0.0));
+            let ray = (world.coords - camera.eye).normalize();
+            let point = camera.direction_to_yaw_pitch(&ray);
+            [CameraId::Left, CameraId::Right].into_iter().any(|side| {
+                super::super::panorama_to_camera(point.yaw, point.pitch, side, calibration, scene)
+                    .is_some()
+            })
+        };
+        let mut uncovered = 0;
+        for i in 0..=512 {
+            let p = i as f32 / 256.0 - 1.0;
+            for (x, y) in [(p, -1.0), (p, 1.0), (-1.0, p), (1.0, p), (0.0, p)] {
+                uncovered += usize::from(!covered(x, y));
+            }
+        }
+        uncovered
+    }
+
+    #[test]
+    fn render_fov_removes_actual_rig_top_notch() {
+        let calibration = garage_calibration();
+        let scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, 4032.0 / 3040.0);
+        let coverage = CoverageBoundary::from_calibration(&calibration, &scene);
+        let viewport = ViewportConfig::default();
+        let requested = viewport.fov_degrees.min(coverage.max_fov_degrees());
+        let clamped = coverage.safe_clamp(0.0, 0.0, requested, viewport.aspect_ratio(), 0.0);
+        let pose = ViewportPosition {
+            yaw: clamped.yaw,
+            pitch: clamped.pitch,
+            fov_degrees: Some(requested),
+        };
+        assert!(uncovered_samples(&calibration, &scene, &viewport, pose, requested) > 0);
+        let fitted = coverage.fit_render_fov(pose, &viewport, &calibration, &scene);
+        assert!(
+            fitted > requested * 0.85,
+            "excessive zoom: {requested} -> {fitted}"
+        );
+        assert!(fitted < requested);
+        assert_eq!(
+            uncovered_samples(&calibration, &scene, &viewport, pose, fitted),
+            0
+        );
+        let fitted_pose = ViewportPosition {
+            fov_degrees: Some(fitted),
+            ..pose
+        };
+        assert_eq!(
+            coverage.fit_render_fov(fitted_pose, &viewport, &calibration, &scene),
+            fitted
+        );
+        let next_center = coverage.safe_clamp(0.0, 0.0, fitted, viewport.aspect_ratio(), 0.0);
+        let next_pose = ViewportPosition {
+            yaw: next_center.yaw,
+            pitch: next_center.pitch,
+            fov_degrees: Some(fitted),
+        };
+        assert_eq!(
+            coverage.fit_render_fov(next_pose, &viewport, &calibration, &scene),
+            fitted
+        );
+    }
+
+    #[test]
+    fn render_fov_checks_actual_tilted_and_rolled_view() {
+        let calibration = garage_calibration();
+        let scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, 4032.0 / 3040.0);
+        let coverage = CoverageBoundary::from_calibration(&calibration, &scene);
+        let viewport = ViewportConfig {
+            rig_tilt: 0.25,
+            rig_roll: 0.12,
+            ..ViewportConfig::default()
+        };
+        let camera = super::super::VirtualCamera::new(&scene.camera_position);
+        let (yaw, pitch) = crate::lens::rig_correction::world_to_render_pose(
+            &camera,
+            0.0,
+            0.0,
+            viewport.rig_tilt,
+            viewport.rig_roll,
+        );
+        let pose = ViewportPosition {
+            yaw,
+            pitch,
+            fov_degrees: Some(75.0),
+        };
+        let fitted = coverage.fit_render_fov(pose, &viewport, &calibration, &scene);
+        assert!(
+            fitted > 45.0 && fitted <= 75.0,
+            "unexpected fitted FOV: {fitted}"
+        );
+        assert_eq!(
+            uncovered_samples(&calibration, &scene, &viewport, pose, fitted),
+            0
+        );
+    }
+
+    #[test]
+    fn render_fov_does_not_move_an_uncovered_center() {
+        let calibration = garage_calibration();
+        let scene = SceneGeometry::from_layout_with_aspect(&calibration.layout, 4032.0 / 3040.0);
+        let coverage = CoverageBoundary::from_calibration(&calibration, &scene);
+        let pose = ViewportPosition {
+            yaw: std::f32::consts::PI,
+            pitch: 0.0,
+            fov_degrees: Some(75.0),
+        };
+        assert_eq!(
+            coverage.fit_render_fov(pose, &ViewportConfig::default(), &calibration, &scene),
+            75.0
+        );
     }
 }

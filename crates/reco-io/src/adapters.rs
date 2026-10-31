@@ -5,7 +5,9 @@
 //! in `reco-core`. Backend code stays clean and trait-free; all trait
 //! plumbing lives here.
 
+#[cfg(feature = "ffmpeg")]
 use reco_core::encoder::{EncodeError, Encoder, OutputFrame, PixelFormat};
+#[cfg(feature = "ffmpeg")]
 use reco_core::source::{FramePair, SourceError, SourceInfo, StereoFrame, YuvData};
 
 #[cfg(feature = "ffmpeg")]
@@ -605,6 +607,11 @@ impl FfmpegFileEncoder {
     /// The name of the active encoder (e.g. "libx264", "h264_nvenc").
     pub fn encoder_name(&self) -> &str {
         self.inner.encoder_name()
+    }
+
+    /// Use elapsed time for live capture instead of file-export frame counts.
+    pub fn use_realtime_timestamps(&mut self) {
+        self.inner.use_realtime_timestamps();
     }
 }
 

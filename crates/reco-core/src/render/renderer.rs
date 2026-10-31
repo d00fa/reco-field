@@ -18,11 +18,14 @@
 //! ```
 //!
 //! Each plane is a textured quad positioned in 3D space (L-shape geometry).
-//! YUV/NV12 to RGB conversion (BT.709), fisheye undistortion, and color
-//! correction all happen in the fragment shader. Uploading YUV directly
+//! YUV/NV12 to RGB conversion (per-camera BT.601 or BT.709) and fisheye undistortion happen in
+//! the fragment shader. Separate warped planes then undergo overlap colour
+//! matching and coverage-normalized multiband blending on the GPU. Uploading YUV directly
 //! reduces CPU-GPU transfer from 8.3 MB to 3.1 MB per frame (62% less
 //! bandwidth) and eliminates CPU-side swscale color conversion entirely.
 
+use super::blend::SeamBlender;
+use super::panorama::PanoramaGeometry;
 use super::scene::SceneGeometry;
 use super::viewport::ResolvedViewport;
 use crate::calibration::{CameraParams, MatchCalibration};
@@ -71,6 +74,9 @@ pub(crate) struct GpuUniforms {
     color_offset_blend: [f32; 4],
     flags: [u32; 4],
     pub(crate) lens_preview: [f32; 4],
+    panorama_to_plane: [[f32; 4]; 4],
+    panorama_bounds: [f32; 4],
+    panorama_plane: [f32; 4],
 }
 
 /// Vertex with 3D position and UV coordinates.
@@ -167,6 +173,25 @@ pub enum InputFormat {
     Bgra,
 }
 
+/// YCbCr matrix used by a camera or video decoder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum YuvMatrix {
+    /// Standard-definition matrix, also used by Jetson's untagged NV12 surfaces.
+    Bt601,
+    /// Existing default for decoded video inputs.
+    #[default]
+    Bt709,
+}
+
+/// Per-camera input colour metadata. Output conversion remains BT.709 limited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputColorimetry {
+    /// Coefficients used to recover RGB from the source YCbCr samples.
+    pub matrix: YuvMatrix,
+    /// True for full-range YCbCr; false for limited-range video.
+    pub full_range: bool,
+}
+
 /// GPU-side pixel format for NV12-family zero-copy decode output.
 ///
 /// Determines texture formats and byte widths for CUDA/Vulkan shared
@@ -225,6 +250,9 @@ impl GpuPixelFormat {
 /// Created once per pipeline and reused for every frame.
 pub(crate) struct Renderer {
     pipeline: wgpu::RenderPipeline,
+    panorama_pipeline: wgpu::RenderPipeline,
+    pub(crate) panorama: Option<PanoramaGeometry>,
+    blender: SeamBlender,
     vertex_buffer: wgpu::Buffer,
     left: PlaneResources,
     right: PlaneResources,
@@ -234,8 +262,7 @@ pub(crate) struct Renderer {
     output_height: u32,
     /// Input pixel format (YUV420P or NV12).
     input_format: InputFormat,
-    /// Full-range YUV (0-255) instead of limited (16-235).
-    is_full_range: bool,
+    input_colorimetry: [InputColorimetry; 2],
     /// Stored for creating bind groups from external textures (zero-copy).
     texture_layout: wgpu::BindGroupLayout,
     /// Shared sampler, stored for bind group creation.
@@ -329,7 +356,7 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        // Render pipeline with alpha blending for seam transition
+        // Preserve each warped image and its validity before multiband blending.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("stitch_render_pipeline"),
             layout: Some(&pipeline_layout),
@@ -341,18 +368,11 @@ impl Renderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some("fs_warp"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: output_format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent::OVER,
-                    }),
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -362,6 +382,32 @@ impl Renderer {
                 cull_mode: None, // Both sides visible
                 ..Default::default()
             },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let panorama_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("panorama_render_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_panorama"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_panorama"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
@@ -419,6 +465,9 @@ impl Renderer {
 
         Self {
             pipeline,
+            panorama_pipeline,
+            panorama: None,
+            blender: SeamBlender::new(gpu, output_width, output_height, output_format),
             vertex_buffer,
             left,
             right,
@@ -427,7 +476,7 @@ impl Renderer {
             output_width,
             output_height,
             input_format,
-            is_full_range: false,
+            input_colorimetry: [InputColorimetry::default(); 2],
             texture_layout,
             sampler,
             device: device.clone(),
@@ -765,7 +814,13 @@ impl Renderer {
 
     /// Set full-range YUV mode for the shader.
     pub fn set_full_range(&mut self, full_range: bool) {
-        self.is_full_range = full_range;
+        for colorimetry in &mut self.input_colorimetry {
+            colorimetry.full_range = full_range;
+        }
+    }
+
+    pub fn set_input_colorimetry(&mut self, left: InputColorimetry, right: InputColorimetry) {
+        self.input_colorimetry = [left, right];
     }
 
     /// Create fresh `TextureView`s for the left plane's Y/U/V
@@ -854,9 +909,11 @@ impl Renderer {
             blend_width,
             self.input_format,
             self.flip_180[0],
-            self.is_full_range,
+            self.input_colorimetry[0].full_range,
         );
         left_uniforms.lens_preview[0] = correction;
+        left_uniforms.color_scale[3] =
+            f32::from(self.input_colorimetry[0].matrix == YuvMatrix::Bt601);
 
         let right_mvp = projection * view * scene.model_matrix_right();
         let mut right_uniforms = build_gpu_uniforms(
@@ -866,9 +923,31 @@ impl Renderer {
             blend_width,
             self.input_format,
             self.flip_180[1],
-            self.is_full_range,
+            self.input_colorimetry[1].full_range,
         );
         right_uniforms.lens_preview[0] = correction;
+        right_uniforms.color_scale[3] =
+            f32::from(self.input_colorimetry[1].matrix == YuvMatrix::Bt601);
+
+        if let Some(panorama) = &self.panorama {
+            let b = panorama.bounds;
+            for (index, uniforms) in [&mut left_uniforms, &mut right_uniforms]
+                .into_iter()
+                .enumerate()
+            {
+                uniforms.panorama_to_plane = matrix4_to_columns(&panorama.view_to_plane[index]);
+                uniforms.panorama_bounds = [b.yaw_min, b.yaw_span, b.height_top, b.height_span];
+                uniforms.panorama_plane = [panorama.plane_width, panorama.plane_aspect, 0.0, 0.0];
+            }
+        }
+
+        {
+            use std::hash::{Hash, Hasher};
+            let mut geometry = std::collections::hash_map::DefaultHasher::new();
+            bytemuck::bytes_of(&left_uniforms).hash(&mut geometry);
+            bytemuck::bytes_of(&right_uniforms).hash(&mut geometry);
+            self.blender.set_geometry(geometry.finish());
+        }
 
         gpu.queue.write_buffer(
             &self.left.uniform_buffer,
@@ -887,14 +966,15 @@ impl Renderer {
                 label: Some(encoder_label),
             });
 
-        {
+        let warp_views = self.blender.warp_views();
+        for (index, warp_view) in warp_views.iter().enumerate() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("stitch_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
+                    view: warp_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -905,17 +985,20 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(&self.pipeline);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            if self.panorama.is_some() {
+                pass.set_pipeline(&self.panorama_pipeline);
+            } else {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            }
 
-            pass.set_bind_group(0, &self.left.texture_bind_group, &[]);
-            pass.set_bind_group(1, &self.left.uniform_bind_group, &[]);
-            pass.draw(0..6, 0..1);
-
-            pass.set_bind_group(0, &self.right.texture_bind_group, &[]);
-            pass.set_bind_group(1, &self.right.uniform_bind_group, &[]);
-            pass.draw(0..6, 0..1);
+            let plane = if index == 0 { &self.left } else { &self.right };
+            pass.set_bind_group(0, &plane.texture_bind_group, &[]);
+            pass.set_bind_group(1, &plane.uniform_bind_group, &[]);
+            pass.draw(0..if self.panorama.is_some() { 3 } else { 6 }, 0..1);
         }
+        self.blender
+            .encode(gpu, &mut encoder, target_view, blend_width);
 
         encoder
     }
@@ -1174,7 +1257,7 @@ fn upload_nv12(
 /// planes meet) by default. This matches v1 Three.js where the OrbitControls
 /// target is `[0, 0, 0]`. `yaw` rotates around Y (left/right from center),
 /// `pitch` rotates around X (up/down).
-fn view_matrix(
+pub(crate) fn view_matrix(
     position: &[f32; 3],
     yaw: f32,
     pitch: f32,
@@ -1274,6 +1357,9 @@ pub(crate) fn build_gpu_uniforms(
         // Full correction for normal stitching. LensPreviewRenderer
         // overrides this field for the single-camera preview mode.
         lens_preview: [1.0, 0.0, 0.0, 0.0],
+        panorama_to_plane: [[0.0; 4]; 4],
+        panorama_bounds: [0.0; 4],
+        panorama_plane: [0.0; 4],
     }
 }
 

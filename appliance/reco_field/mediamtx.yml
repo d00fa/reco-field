@@ -1,0 +1,24 @@
+logLevel: info
+logDestinations: [stdout]
+
+api: yes
+apiAddress: 127.0.0.1:9997
+
+rtsp: no
+rtmp: yes
+rtmpAddress: 127.0.0.1:1935
+
+hls: yes
+hlsAddress: 127.0.0.1:8888
+hlsAllowOrigins: ["*"]
+hlsVariant: lowLatency
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentCount: 7
+
+webrtc: no
+moq: no
+srt: no
+
+paths:
+  all_others: {}
