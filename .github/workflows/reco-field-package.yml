@@ -40,7 +40,7 @@ jobs:
           for script in appliance/packaging/debian/{preinst,postinst,prerm,postrm}; do sh -n "$script"; done
       - name: Source release archive
         run: bash appliance/scripts/package.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: reco-field-source
           path: appliance/dist/*source.tar.gz*
