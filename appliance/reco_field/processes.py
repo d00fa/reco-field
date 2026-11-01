@@ -5,6 +5,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -121,22 +122,30 @@ class ManagedProcess:
     def wait(self, timeout: float | None = None) -> int:
         if self.process is None:
             raise RuntimeError("process not started")
-        return self.process.wait(timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        code = self.process.wait(timeout=timeout)
+        if self._reader and self._reader is not threading.current_thread():
+            # A child or a blocked callback may retain the pipe after the process exits.
+            remaining = 2.0 if deadline is None else min(2.0, max(0.0, deadline - time.monotonic()))
+            self._reader.join(timeout=remaining)
+        return code
 
     def stop(self, grace_seconds: float = 10.0) -> int:
         process = self.process
-        if process is None or process.poll() is not None:
-            return process.returncode if process else 0
+        if process is None:
+            return 0
+        if process.poll() is not None:
+            return self.wait()
         self._signal_group(process, signal.SIGINT if os.name == "posix" else signal.CTRL_BREAK_EVENT)
         try:
-            return process.wait(timeout=grace_seconds)
+            return self.wait(timeout=grace_seconds)
         except subprocess.TimeoutExpired:
             self._signal_group(process, signal.SIGTERM)
             try:
-                return process.wait(timeout=3)
+                return self.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self._signal_group(process, signal.SIGKILL)
-                return process.wait(timeout=3)
+                return self.wait(timeout=3)
 
     @staticmethod
     def _signal_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:

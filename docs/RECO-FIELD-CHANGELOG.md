@@ -1,6 +1,6 @@
 # Reco Field change record
 
-This cumulative record describes the appliance work through **31 October 2026**
+This cumulative record describes the appliance work through **1 November 2026**
 on top of Reco Video Stitcher 0.5.4. It separates shipped behavior, device
 configuration and unverified capabilities. Version 0.2.0 is the first portable
 Debian appliance release; the earlier development deployment was version 0.1.0.
@@ -8,6 +8,34 @@ Debian appliance release; the earlier development deployment was version 0.1.0.
 For architecture, measured results and operating limits, see
 [Reco Field](RECO-FIELD.md). For installation, updates and recovery, see the
 [operating guide](../appliance/README.md).
+
+## 0.2.1 — 2026-11-01
+
+### Fixed: capture failure diagnostics
+
+- Drain buffered process output after exit, with a bounded timeout and no
+  self-join, before consuming final errors and completion callbacks.
+- Show the actual fatal capture error instead of later Argus cleanup messages.
+- Bound log inspection to 64 KiB, strip terminal formatting and exclude errors
+  from an earlier invocation, including across log rotation.
+- Keep stream credentials redacted and preserve existing recordings and settings.
+
+The reported failure was a right-camera `Argus Correctable Error Status` with
+matching daemon `PIX_SHORT`/CSI faults. Its 74.433-second partial recording was
+finalized and the final five seconds decoded successfully. Camera connections
+were reported unchanged. The diagnostic fix does not establish the cause of
+that intermittent sensor-input failure or claim to eliminate it. Native camera,
+stitching and encoder code are unchanged in this release.
+
+Validation: 242 Python tests and 19 dashboard tests passed; seven local
+OpenCV/media tests were skipped because their runtime prerequisites were absent.
+The upgrade preserved all 11 checked configuration files and 82 existing
+recording files without restarting Recobox or Argus. The installed diagnostic
+was checked with a real failed child process followed by buffered cleanup output.
+A subsequent live recording reproduced a right-frame timeout after about
+50 seconds. A direct dual-camera GStreamer-to-fakesink test, without Reco,
+also failed with a sensor timeout and `NvBufSurfaceFromFd Failed`. This is an
+unresolved camera-stack reliability issue, not a successful endurance test.
 
 ## 0.2.0 — 2026-10-31
 

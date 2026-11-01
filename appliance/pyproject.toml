@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reco-field"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local operator service for the Reco Field Jetson appliance"
 requires-python = ">=3.10"
 dependencies = [

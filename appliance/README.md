@@ -18,14 +18,14 @@ Microphone capture is not configured.
 
 Download the `.deb` and `SHA256SUMS` from
 [Reco Field releases](https://github.com/d00fa/reco-field/releases). Version
-`0.2.0` targets **ARM64 Ubuntu 22.04 / JetPack 6 / L4T 36**, with NVIDIA
+`0.2.1` targets **ARM64 Ubuntu 22.04 / JetPack 6 / L4T 36**, with NVIDIA
 OpenCV 4.8 and its Python bindings. It does not support JetPack 5, a desktop
 Ubuntu PC, or an arbitrary camera driver. The tested configuration is the
 Orin Nano Super and two IMX477 cameras described above.
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-sudo apt install ./reco-field_0.2.0_arm64.deb
+sudo apt install ./reco-field_0.2.1_arm64.deb
 sudo reco-field-setup --device /dev/nvme0n1p1 --hostname reco-field-01
 ```
 
@@ -305,6 +305,32 @@ Other camera applications must be idle before recording, taking setup views,
 or calibrating. Reco Field and recobox can run their web services together,
 but they share the same physical cameras and NVIDIA Argus service. Restarting
 that service from either application interrupts every active camera session.
+
+## Capture stopped with an error
+
+Version 0.2.1 reports the capture error ahead of buffered `GST_ARGUS` shutdown
+messages. `Done Success` describes camera cleanup; it does not establish that
+the recording succeeded. Process output is drained with a bounded wait before
+the app reads the final diagnostic. Error selection is limited to the current
+invocation and at most 64 KiB of recent logs.
+
+An `Argus Correctable Error Status` with daemon `PIX_SHORT` or `CSIMUX_FRAME`
+messages means the camera input failed. On the prototype, this stopped capture
+while the encoder still finalized a playable partial recording. Existing files
+are preserved; check the recording duration before relying on it. Start a new
+recording to retry after the previous process has stopped. Reco Field does not
+restart the shared Argus service automatically.
+
+If it repeats, collect the application capture log and matching Argus/kernel
+logs before rebooting:
+
+```bash
+sudo journalctl -u nvargus-daemon --since '10 minutes ago' --no-pager
+sudo journalctl -k --since '10 minutes ago' --no-pager
+```
+
+The observed CSI fault is still under investigation. This diagnostic update
+does not claim to repair the sensor driver or the physical camera connection.
 
 ## Phone hotspot
 

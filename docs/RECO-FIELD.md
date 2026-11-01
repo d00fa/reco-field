@@ -9,7 +9,7 @@ It builds on the Rust and wgpu engine in
 [Reco Video Stitcher](https://github.com/reco-project/video-stitcher). The work
 described here adds the appliance and changes the capture, stitching and media
 paths needed by the tested Jetson. This is the public implementation record as
-of **31 October 2026**. See the [change record](RECO-FIELD-CHANGELOG.md) for the
+of **1 November 2026**. See the [change record](RECO-FIELD-CHANGELOG.md) for the
 individual additions, fixes and configuration changes, and the
 [installation and operating guide](../appliance/README.md) for release commands.
 
@@ -33,6 +33,12 @@ H.264 encoding consumes CPU time. These results do not establish compatibility
 with older Jetson Nano devices, other JetPack releases, other camera drivers or
 different sensor crops. Camera drivers and the NVIDIA software stack must work
 before installing the appliance.
+
+The prototype already uses the patched IMX477 driver and matching device tree
+from [Reco Kit](https://github.com/reco-project/kit/tree/02c5e8d/driver), which
+expose the full-sensor mode above. The appliance package does not replace kernel
+camera drivers or device-tree overlays. A new unit needs a working, matching
+camera stack before appliance installation and its own lens/rig calibration.
 
 The prototype's exact lenses have not yet been physically measured. A nominal
 wide-angle specification is not a measurement of horizontal coverage on these
@@ -294,6 +300,21 @@ boundary disagreement from **6.16 to 2.73**, and the 95th percentile from
 image quality, sports motion or equivalence to a commercial camera. Low-light
 noise also produced panorama bitrates around 88 Mbit/s, making original-quality
 streaming unsuitable for many uplinks and recordings substantially larger.
+
+On 1 November, repeated mid-capture Argus failures produced `PIX_SHORT` and CSI
+faults in the daemon log. One failed panorama retained a finalized 74.433-second
+file whose final five seconds decoded successfully. Version 0.2.1 fixes the
+misleading error display: buffered cleanup output no longer hides the actual
+capture failure. It also waits briefly for the process-output reader before
+using final callbacks. A 625-second preview reported 30 fps without a fault,
+but a subsequent recording stopped after about 50 seconds when the right camera
+stopped delivering frames. A direct dual-camera GStreamer-to-fakesink test also
+failed with an Argus sensor timeout and `NvBufSurfaceFromFd Failed`, without
+Reco's renderer or encoder running. The sensor-input fault remains an unresolved
+reliability issue; restarting a capture successfully does not prove it has been
+repaired. This diagnostic release changes no camera driver or device tree. A
+manual shared-Argus restart was separately authorized for fault isolation; it
+is not part of installation or automatic capture recovery.
 
 ## Validation and remaining work
 

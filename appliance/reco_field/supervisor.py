@@ -1797,18 +1797,38 @@ class Supervisor:
 
     @staticmethod
     def _log_tail(path: Path, limit: int = 400) -> str:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return "no process log"
-        text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+        chunks = []
+        remaining = 65_536
+        for candidate in (path, path.with_suffix(path.suffix + ".1")):
+            try:
+                with candidate.open("rb") as handle:
+                    size = handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, size - remaining))
+                    chunk = handle.read(remaining)
+            except OSError:
+                if candidate == path:
+                    return "no process log"
+                continue
+            remaining -= len(chunk)
+            if size > len(chunk):
+                chunk = chunk.partition(b"\n")[2]
+            chunks.insert(0, chunk)
+            if not remaining:
+                break
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
         text = "".join(
             character
             for character in text
             if character in "\n\t" or ord(character) >= 32
         )
-        text = " ".join(text.split())
-        return text[-limit:] or "no process output"
+        lines = text.splitlines()
+        start = max((index + 1 for index, line in enumerate(lines) if line.startswith("$ ")), default=0)
+        lines = lines[start:]
+        errors = [line.strip() for line in lines if re.match(r"^(?:Error:|(?:\S+\s+)?(?:ERROR|FATAL)\b)", line.strip())]
+        if errors:
+            return " ".join(errors[-1].split())[:limit]
+        return " ".join(" ".join(lines).split())[-limit:] or "no process output"
 
     def _check_disk(self) -> None:
         try:
