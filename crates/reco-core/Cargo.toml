@@ -18,7 +18,7 @@ cc = { version = "1", optional = true }
 pkg-config = { version = "0.3", optional = true }
 
 [dependencies]
-wgpu = { version = "28", features = ["vulkan-portability"] }
+wgpu = { version = "30", features = ["vulkan-portability"] }
 bytemuck = { version = "1", features = ["derive"] }
 nalgebra = "0.35"
 serde = { version = "1", features = ["derive"] }
